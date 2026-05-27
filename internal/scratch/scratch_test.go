@@ -49,8 +49,8 @@ func TestSelectReapCandidatesIdleUsesMostRecentOfActiveOrToggled(t *testing.T) {
 	restore := stubInventory(t, []scratchFixture{
 		{
 			name: "gs/sh/1", parentPane: "%1", parentExists: true, cwd: "/live",
-			lastActiveAt: fixtureNow().Add(-5 * time.Hour),
-			metadata:     map[string]string{lastToggledAtKey: fixtureNow().Add(-10 * time.Minute).Format(time.RFC3339)},
+			lastActiveAt:  fixtureNow().Add(-5 * time.Hour),
+			lastToggledAt: fixtureNow().Add(-10 * time.Minute).Format(time.RFC3339),
 		},
 	})
 	defer restore()
@@ -82,7 +82,7 @@ func TestSelectReapCandidatesIncludesDeadCwd(t *testing.T) {
 
 func TestSelectReapCandidatesTreatsMissingMetadataAsOrphan(t *testing.T) {
 	restore := stubInventory(t, []scratchFixture{
-		{name: "gs/sh/1", parentErr: errors.New("missing"), cwd: "/live", lastActiveAt: fixtureNow().Add(-1 * time.Minute)},
+		{name: "gs/sh/1", parentPane: "", cwd: "/live", lastActiveAt: fixtureNow().Add(-1 * time.Minute)},
 	})
 	defer restore()
 
@@ -211,28 +211,24 @@ func TestMarkToggledPersistsTimestamp(t *testing.T) {
 }
 
 type scratchFixture struct {
-	name         string
-	parentPane   string
-	parentErr    error
-	parentExists bool
-	cwd          string
-	deadCwd      bool
-	lastActiveAt time.Time
-	createdAt    time.Time
-	metadata     map[string]string
+	name          string
+	parentPane    string // "" simulates a session missing its parent-pane var (orphan)
+	parentExists  bool
+	cwd           string
+	deadCwd       bool
+	lastActiveAt  time.Time
+	createdAt     time.Time
+	openedAt      string // raw @shadow_opened_at
+	lastToggledAt string // raw @shadow_last_toggled_at
 }
 
 func stubInventory(t *testing.T, fixtures []scratchFixture) func() {
 	t.Helper()
 
-	origList, origGet, origPaneExists, origPathExists, origNow := listSessionSnapshotsByPrefix, getSessionVar, paneExists, pathExists, now
+	origList, origPanes, origPathExists, origNow := listScratchSnapshots, livePaneIDs, pathExists, now
 
-	snapshots := make([]tmux.SessionSnapshot, 0, len(fixtures))
-	parents := map[string]string{}
-	parentErrs := map[string]error{}
-	parentExists := map[string]bool{}
-	metadata := map[string]map[string]string{}
-	cwds := map[string]string{}
+	snapshots := make([]tmux.ScratchSnapshot, 0, len(fixtures))
+	panes := map[string]bool{}
 	deadCwds := map[string]bool{}
 
 	for _, f := range fixtures {
@@ -244,32 +240,25 @@ func stubInventory(t *testing.T, fixtures []scratchFixture) func() {
 		if active.IsZero() {
 			active = fixtureNow().Add(-time.Hour)
 		}
-		snapshots = append(snapshots, tmux.SessionSnapshot{Name: f.name, Created: created, Activity: active})
-		parents[f.name] = f.parentPane
-		parentErrs[f.name] = f.parentErr
-		parentExists[f.parentPane] = f.parentExists
-		metadata[f.name] = f.metadata
-		cwds[f.name] = f.cwd
+		snapshots = append(snapshots, tmux.ScratchSnapshot{
+			Name:          f.name,
+			Created:       created,
+			Activity:      active,
+			Cwd:           f.cwd,
+			ParentPane:    f.parentPane,
+			OpenedAt:      f.openedAt,
+			LastToggledAt: f.lastToggledAt,
+		})
+		if f.parentPane != "" && f.parentExists {
+			panes[f.parentPane] = true
+		}
 		if f.cwd != "" && f.deadCwd {
 			deadCwds[f.cwd] = true
 		}
 	}
 
-	listSessionSnapshotsByPrefix = func(string) ([]tmux.SessionSnapshot, error) { return snapshots, nil }
-	getSessionVar = func(session, key string) (string, error) {
-		switch key {
-		case parentPaneKey:
-			return parents[session], parentErrs[session]
-		case cwdKey:
-			return cwds[session], nil
-		default:
-			if m := metadata[session]; m != nil {
-				return m[key], nil
-			}
-			return "", nil
-		}
-	}
-	paneExists = func(id string) bool { return parentExists[id] }
+	listScratchSnapshots = func(string) ([]tmux.ScratchSnapshot, error) { return snapshots, nil }
+	livePaneIDs = func() (map[string]bool, error) { return panes, nil }
 	pathExists = func(p string) bool {
 		if p == "" {
 			return true
@@ -279,6 +268,6 @@ func stubInventory(t *testing.T, fixtures []scratchFixture) func() {
 	now = fixtureNow
 
 	return func() {
-		listSessionSnapshotsByPrefix, getSessionVar, paneExists, pathExists, now = origList, origGet, origPaneExists, origPathExists, origNow
+		listScratchSnapshots, livePaneIDs, pathExists, now = origList, origPanes, origPathExists, origNow
 	}
 }

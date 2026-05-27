@@ -88,10 +88,6 @@ omitted they are resolved from the current tmux context.`,
 			return fmt.Errorf("getting pane cwd: %w", err)
 		}
 
-		// Self-heal the scratch namespace on every open (orphan/idle/dead-cwd),
-		// so the gs/ space stays clean without relying on a tmux hook.
-		scratch.ReapOnToggle(cfg.Scratch.TTL.Duration())
-
 		popupCmd := cfg.Scratch.CmdFor(typ)
 		if err := scratch.Ensure(targetSession, paneCwd, typ, parentPane, popupCmd); err != nil {
 			return err

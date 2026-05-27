@@ -37,10 +37,17 @@ type PaneInfo struct {
 	Path        string
 }
 
-type SessionSnapshot struct {
-	Name     string
-	Created  time.Time
-	Activity time.Time
+// ScratchSnapshot bundles a scratch session's metadata, read in a single
+// list-sessions call (the @shadow_* user options are expanded inline). This is
+// what keeps reap O(1) tmux calls instead of O(sessions) show-options calls.
+type ScratchSnapshot struct {
+	Name          string
+	Created       time.Time
+	Activity      time.Time
+	Cwd           string // @shadow_cwd
+	ParentPane    string // @shadow_parent_pane
+	OpenedAt      string // raw @shadow_opened_at (RFC3339 or "")
+	LastToggledAt string // raw @shadow_last_toggled_at
 }
 
 func run(args ...string) (string, error) {
@@ -284,8 +291,10 @@ func ClosePopup(client string) error {
 	return err
 }
 
-func ListSessionSnapshotsByPrefix(prefix string) ([]SessionSnapshot, error) {
-	out, err := run("list-sessions", "-F", "#{session_name}\t#{session_activity}\t#{session_created}")
+// ListScratchSnapshots returns sessions whose name starts with prefix, with
+// their scratch metadata expanded inline (one tmux call regardless of count).
+func ListScratchSnapshots(prefix string) ([]ScratchSnapshot, error) {
+	out, err := run("list-sessions", "-F", "#{session_name}\t#{session_created}\t#{session_activity}\t#{@shadow_cwd}\t#{@shadow_parent_pane}\t#{@shadow_opened_at}\t#{@shadow_last_toggled_at}")
 	if err != nil {
 		if strings.Contains(err.Error(), "no server running") || strings.Contains(err.Error(), "no sessions") {
 			return nil, nil
@@ -295,21 +304,45 @@ func ListSessionSnapshotsByPrefix(prefix string) ([]SessionSnapshot, error) {
 	if out == "" {
 		return nil, nil
 	}
-	var snapshots []SessionSnapshot
+	var snapshots []ScratchSnapshot
 	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "\t", 3)
-		if len(parts) < 3 || !strings.HasPrefix(parts[0], prefix) {
+		parts := strings.SplitN(line, "\t", 7)
+		if len(parts) < 7 || !strings.HasPrefix(parts[0], prefix) {
 			continue
 		}
-		activity, _ := strconv.ParseInt(parts[1], 10, 64)
-		created, _ := strconv.ParseInt(parts[2], 10, 64)
-		snapshots = append(snapshots, SessionSnapshot{
-			Name:     parts[0],
-			Activity: time.Unix(activity, 0).UTC(),
-			Created:  time.Unix(created, 0).UTC(),
+		created, _ := strconv.ParseInt(parts[1], 10, 64)
+		activity, _ := strconv.ParseInt(parts[2], 10, 64)
+		snapshots = append(snapshots, ScratchSnapshot{
+			Name:          parts[0],
+			Created:       time.Unix(created, 0).UTC(),
+			Activity:      time.Unix(activity, 0).UTC(),
+			Cwd:           parts[3],
+			ParentPane:    parts[4],
+			OpenedAt:      parts[5],
+			LastToggledAt: parts[6],
 		})
 	}
 	return snapshots, nil
+}
+
+// LivePaneIDs returns the set of every pane id across all sessions, so orphan
+// detection is one tmux call instead of a has-pane probe per scratch session.
+func LivePaneIDs() (map[string]bool, error) {
+	out, err := run("list-panes", "-a", "-F", "#{pane_id}")
+	if err != nil {
+		if strings.Contains(err.Error(), "no server running") || strings.Contains(err.Error(), "no sessions") {
+			return map[string]bool{}, nil
+		}
+		return nil, err
+	}
+	ids := map[string]bool{}
+	if out == "" {
+		return ids, nil
+	}
+	for _, line := range strings.Split(out, "\n") {
+		ids[line] = true
+	}
+	return ids, nil
 }
 
 func PaneExists(paneID string) bool {

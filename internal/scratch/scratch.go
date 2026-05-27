@@ -38,15 +38,15 @@ const (
 
 // Indirections for testing seams.
 var (
-	listSessionSnapshotsByPrefix = tmux.ListSessionSnapshotsByPrefix
-	getSessionVar                = tmux.GetSessionVar
-	setSessionVar                = tmux.SetSessionVar
-	sessionExists                = tmux.SessionExists
-	newSessionWithCommand        = tmux.NewSessionWithCommand
-	paneExists                   = tmux.PaneExists
-	killSession                  = defaultKillSession
-	pathExists                   = defaultPathExists
-	now                          = time.Now
+	listScratchSnapshots  = tmux.ListScratchSnapshots
+	livePaneIDs           = tmux.LivePaneIDs
+	getSessionVar         = tmux.GetSessionVar
+	setSessionVar         = tmux.SetSessionVar
+	sessionExists         = tmux.SessionExists
+	newSessionWithCommand = tmux.NewSessionWithCommand
+	killSession           = defaultKillSession
+	pathExists            = defaultPathExists
+	now                   = time.Now
 )
 
 type ReapReason string
@@ -252,37 +252,41 @@ func Reap(opts ReapOptions) (ReapReport, error) {
 	return report, nil
 }
 
-// ReapOnToggle runs a best-effort sweep (orphan + dead-cwd + idle) so the
-// scratch namespace self-cleans on normal use, with no reliance on a tmux hook.
-func ReapOnToggle(ttl time.Duration) {
-	_, _ = Reap(ReapOptions{TTL: ttl})
-}
-
+// listScratchSessions reads the whole gs/ namespace in two tmux calls: one
+// list-sessions (with the @shadow_* vars expanded inline) and one list-panes
+// for orphan detection. This is deliberately O(1) in tmux invocations — an
+// earlier version did ~2 show-options per session, which made reap (and the
+// since-removed reap-on-toggle) scale badly with session count.
 func listScratchSessions() ([]scratchSessionState, error) {
-	snapshots, err := listSessionSnapshotsByPrefix(Prefix + "/")
+	snapshots, err := listScratchSnapshots(Prefix + "/")
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshots) == 0 {
+		return nil, nil
+	}
+
+	panes, err := livePaneIDs()
 	if err != nil {
 		return nil, err
 	}
 
 	sessions := make([]scratchSessionState, 0, len(snapshots))
-	for _, snapshot := range snapshots {
+	for _, snap := range snapshots {
 		session := scratchSessionState{
-			name:          snapshot.Name,
-			typ:           sessionType(snapshot.Name),
-			openedAt:      sessionMetadataTime(snapshot.Name, openedAtKey, snapshot.Created),
-			lastToggledAt: sessionMetadataTime(snapshot.Name, lastToggledAtKey, snapshot.Activity),
-			lastActiveAt:  snapshot.Activity,
+			name:          snap.Name,
+			typ:           sessionType(snap.Name),
+			cwd:           snap.Cwd,
+			openedAt:      metadataTime(snap.OpenedAt, snap.Created),
+			lastToggledAt: metadataTime(snap.LastToggledAt, snap.Activity),
+			lastActiveAt:  snap.Activity,
 		}
-		session.cwd, _ = getSessionVar(snapshot.Name, cwdKey)
-
-		parentPane, err := getSessionVar(snapshot.Name, parentPaneKey)
-		if err != nil || parentPane == "" {
+		if snap.ParentPane == "" {
 			session.orphan = true
 		} else {
-			session.parentPane = parentPane
-			session.orphan = !paneExists(parentPane)
+			session.parentPane = snap.ParentPane
+			session.orphan = !panes[snap.ParentPane]
 		}
-
 		sessions = append(sessions, session)
 	}
 	return sessions, nil
@@ -296,12 +300,14 @@ func sessionType(name string) string {
 	return parts[1]
 }
 
-func sessionMetadataTime(sessionName, key string, fallback time.Time) time.Time {
-	raw, err := getSessionVar(sessionName, key)
-	if err != nil || strings.TrimSpace(raw) == "" {
+// metadataTime parses a stored RFC3339 timestamp, falling back to the tmux
+// session time (created/activity) when the var is unset or malformed.
+func metadataTime(raw string, fallback time.Time) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return fallback
 	}
-	ts, err := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	ts, err := time.Parse(time.RFC3339, raw)
 	if err != nil {
 		return fallback
 	}

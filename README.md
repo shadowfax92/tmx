@@ -4,7 +4,7 @@
 
 **Get around tmux — and keep a scratch popup one keystroke away.**
 
-*A colored session tree, window/pane jump with live previews, pane labels, and self-healing scratch popups. No worktrees, no daemon, no state file.*
+*A colored session tree, window/pane jump with live previews, pane labels, and recreatable scratch popups. No worktrees, no daemon, no state file.*
 
 </div>
 
@@ -13,7 +13,7 @@
 - 🌳 **Session tree as the landing view** — `tmx` opens a colored tree of your sessions grouped by `/`, each annotated with the command it's running. Pick one, switch to it.
 - 🔭 **Jump to any window or pane** — `tmx -w` / `tmx -p` fuzzy-search every window/pane with a live `capture-pane` preview on the right.
 - 🪄 **Scratch popups** — one keybind toggles a popup session (nvim, shell, lazygit, …) rooted at the current pane's directory. Config-driven: any command, any size.
-- 🧹 **One cleanup command** — `tmx reap` kills scratch sessions that are orphaned, idle past a TTL, or rooted in a directory that no longer exists. It also runs on every toggle, so the namespace self-heals with no tmux hook.
+- 🧹 **One cleanup command** — `tmx reap` kills scratch sessions that are orphaned, idle past a TTL, or rooted in a directory that no longer exists. One `list-sessions` + one `list-panes`, so it's instant even with a big `gs/` backlog.
 - 🏷️ **Pane labels** — `tmx rename` labels the current pane from its git branch / repo / folder; `-w` renames the window too.
 - 🔀 **Move windows between sessions** — `tmx move <session>` relocates the current window, creating the target session if needed.
 - 🪶 **Self-contained** — a single Go binary, fzf for the picker, no shared library with grove.
@@ -121,8 +121,10 @@ when any of these holds:
 - **dead-cwd** — its start directory no longer exists on disk
 - **idle** — untouched longer than `scratch.ttl`
 
-Reaping runs on every open toggle, so the namespace self-cleans during normal
-use; the standalone `tmx reap` is for manual sweeps.
+Reaping is a manual sweep — run `tmx reap` (or `tmx reap --dry-run` to preview)
+when the `gs/` namespace gets cluttered. It deliberately does **not** run on
+toggle: that put a full namespace scan on the popup-open hot path, which got
+slow with a large backlog. To automate it, wrap `tmx reap` in a cron/`loop`.
 
 > Scratch sessions keep grove's `gs/` prefix and `shadow_*` session vars, so a
 > previous grove install's popups are adopted automatically. The shell env
