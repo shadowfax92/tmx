@@ -150,6 +150,11 @@ func Ensure(sessionName, paneCwd, typ, paneID, command string) error {
 		killSession(sessionName)
 	}
 
+	// TMX_SCRATCH=1 marks the popup session. Tools inside it (notably the user's
+	// nvim) detect this var and copy via a direct pbcopy path instead of OSC52,
+	// which is unreliable through the nested display-popup client. Renaming or
+	// dropping TMX_SCRATCH silently breaks copy-from-popup — it's an external
+	// contract with editor/tmux config, not just a local marker.
 	env := []string{
 		fmt.Sprintf("TMX_PARENT_PANE=%s", paneID),
 		"TMX_SCRATCH=1",
