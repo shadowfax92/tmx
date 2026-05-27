@@ -63,6 +63,8 @@ tmx reap --ttl 1h   # override the idle threshold
 tmx reap --all      # kill every scratch session
 
 tmx init         # (re)install the tmux keybindings
+tmx config       # show the active width profile + resolved popup sizes
+tmx config --edit  # open the config in $EDITOR
 ```
 
 Default keybinds (from `tmx init`):
@@ -106,6 +108,10 @@ scratch:
         vim: { width: "95%", height: "95%" }
         sh:  { width: "95%", height: "95%" }
 ```
+
+Profiles are matched against the tmux client width (`#{client_width}`), first
+match wins; force one with `TMX_PROFILE=<name>`. Run `tmx config` to see the
+current width, the active profile, and the size each type resolves to.
 
 ## How scratch popups work
 
