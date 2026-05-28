@@ -17,6 +17,7 @@ type SessionInfo struct {
 }
 
 type WindowInfo struct {
+	ID      string
 	Target  string // session_name:window_index
 	Session string
 	Index   int
@@ -247,7 +248,7 @@ func MoveWindow(sourceTarget, targetSession string) error {
 }
 
 func moveWindowArgs(sourceTarget, targetSession string) []string {
-	return []string{"move-window", "-s", "=" + sourceTarget, "-t", "=" + targetSession + ":"}
+	return []string{"move-window", "-s", sourceTarget, "-t", "=" + targetSession + ":"}
 }
 
 func KillWindow(target string) error {
@@ -358,7 +359,7 @@ func PaneExists(paneID string) bool {
 }
 
 func ListWindowInfo() ([]WindowInfo, error) {
-	out, err := run("list-windows", "-a", "-F", "#{session_name}:#{window_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{@pane_label}\t#{pane_current_path}")
+	out, err := run("list-windows", "-a", "-F", "#{window_id}\t#{session_name}:#{window_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{@pane_label}\t#{pane_current_path}")
 	if err != nil {
 		if strings.Contains(err.Error(), "no server running") || strings.Contains(err.Error(), "no sessions") {
 			return nil, nil
@@ -370,18 +371,19 @@ func ListWindowInfo() ([]WindowInfo, error) {
 	}
 	var windows []WindowInfo
 	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "\t", 6)
-		if len(parts) < 6 {
+		parts := strings.SplitN(line, "\t", 7)
+		if len(parts) < 7 {
 			continue
 		}
-		idx, _ := strconv.Atoi(parts[2])
+		idx, _ := strconv.Atoi(parts[3])
 		windows = append(windows, WindowInfo{
-			Target:  parts[0],
-			Session: parts[1],
+			ID:      parts[0],
+			Target:  parts[1],
+			Session: parts[2],
 			Index:   idx,
-			Name:    parts[3],
-			Label:   parts[4],
-			Path:    parts[5],
+			Name:    parts[4],
+			Label:   parts[5],
+			Path:    parts[6],
 		})
 	}
 	return windows, nil

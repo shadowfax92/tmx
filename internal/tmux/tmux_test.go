@@ -6,8 +6,8 @@ import (
 )
 
 func TestMoveWindowArgsUseExplicitSourceAndTarget(t *testing.T) {
-	got := moveWindowArgs("dev:2", "ops")
-	want := []string{"move-window", "-s", "=dev:2", "-t", "=ops:"}
+	got := moveWindowArgs("@42", "ops")
+	want := []string{"move-window", "-s", "@42", "-t", "=ops:"}
 
 	if !slices.Equal(got, want) {
 		t.Fatalf("move window args = %#v, want %#v", got, want)

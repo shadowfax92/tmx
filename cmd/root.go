@@ -158,6 +158,20 @@ func Execute() {
 // of the selection. Lines are "<target>\t<visible columns…>"; callers pass
 // extra fzf args (--with-nth/--nth/--preview). Esc/Ctrl-C yields ErrCancelled.
 func runFzf(prompt string, lines []string, extra []string) (string, error) {
+	targets, err := runFzfMulti(prompt, lines, extra)
+	if err != nil {
+		return "", err
+	}
+	if len(targets) == 0 {
+		return "", ErrCancelled
+	}
+	return targets[0], nil
+}
+
+// runFzfMulti pipes lines into fzf and returns the hidden first tab-delimited
+// field from each selected line. Single-select callers receive one target;
+// multi-select callers pass --multi in extra.
+func runFzfMulti(prompt string, lines []string, extra []string) ([]string, error) {
 	args := []string{
 		"--prompt", prompt,
 		"--height", "100%",
@@ -177,19 +191,29 @@ func runFzf(prompt string, lines []string, extra []string) (string, error) {
 	out, err := fzfCmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 130 {
-			return "", ErrCancelled
+			return nil, ErrCancelled
 		}
 		if len(out) == 0 {
-			return "", ErrCancelled
+			return nil, ErrCancelled
 		}
-		return "", fmt.Errorf("fzf: %w", err)
+		return nil, fmt.Errorf("fzf: %w", err)
 	}
 
-	line := strings.TrimSpace(string(out))
-	if idx := strings.Index(line, "\t"); idx >= 0 {
-		return line[:idx], nil
+	var targets []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		if idx := strings.Index(line, "\t"); idx >= 0 {
+			targets = append(targets, line[:idx])
+			continue
+		}
+		targets = append(targets, line)
 	}
-	return line, nil
+	if len(targets) == 0 {
+		return nil, ErrCancelled
+	}
+	return targets, nil
 }
 
 // switchOrAttach moves the client to target: switch-client inside tmux,
