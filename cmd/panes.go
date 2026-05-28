@@ -40,7 +40,7 @@ func selectPane(all bool) (string, error) {
 	current, _ := tmux.CurrentTarget()
 	home, _ := os.UserHomeDir()
 
-	// Fields: 1=target(hidden) 2=window 3=pane 4=command 5=path. Session is not
+	// Fields: 1=target(hidden) 2=pane 3=window 4=command 5=path. Session is not
 	// shown — the preview makes the context obvious.
 	var lines []string
 	for _, p := range panes {
@@ -48,17 +48,7 @@ func selectPane(all bool) (string, error) {
 		if home != "" && strings.HasPrefix(path, home) {
 			path = "~" + path[len(home):]
 		}
-		marker := "  "
-		if p.Target == current {
-			marker = "● "
-		}
-		window := fmt.Sprintf("%d:%s", p.WindowIndex, p.WindowName)
-		pane := fmt.Sprintf("%d", p.PaneIndex)
-		if p.Label != "" {
-			pane = fmt.Sprintf("%d:%s", p.PaneIndex, p.Label)
-		}
-		lines = append(lines, fmt.Sprintf("%s\t%s%-20s\t%-16s\t%-12s\t%s",
-			p.Target, marker, window, pane, p.Command, path))
+		lines = append(lines, formatPanePickerLine(p, path, p.Target == current))
 	}
 
 	return runFzf("pane > ", lines, []string{
@@ -67,4 +57,20 @@ func selectPane(all bool) (string, error) {
 		"--preview", "tmux capture-pane -ep -t {1}",
 		"--preview-window", "right:50%",
 	})
+}
+
+// formatPanePickerLine keeps the searched pane as the first visible fzf column
+// while preserving field 1 as the hidden tmux target.
+func formatPanePickerLine(p tmux.PaneInfo, path string, current bool) string {
+	marker := "  "
+	if current {
+		marker = "● "
+	}
+	window := fmt.Sprintf("%d:%s", p.WindowIndex, p.WindowName)
+	pane := fmt.Sprintf("%d", p.PaneIndex)
+	if p.Label != "" {
+		pane = fmt.Sprintf("%d:%s", p.PaneIndex, p.Label)
+	}
+	return fmt.Sprintf("%s\t%s%-16s\t%s\t%s\t%s",
+		p.Target, marker, pane, window, p.Command, path)
 }

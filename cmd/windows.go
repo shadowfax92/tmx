@@ -54,19 +54,10 @@ func jumpWindows(all bool) error {
 		currentWindow = currentTarget[:idx]
 	}
 
-	// Fields: 1=target(hidden) 2=session 3=window. Everything visible is searchable.
+	// Fields: 1=target(hidden) 2=window 3=session. Everything visible is searchable.
 	var lines []string
 	for _, w := range windows {
-		marker := "  "
-		if w.Target == currentWindow {
-			marker = "● "
-		}
-		name := w.Name
-		if name == "" {
-			name = w.Label
-		}
-		window := fmt.Sprintf("%d:%s", w.Index, name)
-		lines = append(lines, fmt.Sprintf("%s\t%s%-24s\t%s", w.Target, marker, w.Session, window))
+		lines = append(lines, formatWindowPickerLine(w, w.Target == currentWindow))
 	}
 
 	target, err := runFzf("window > ", lines, []string{
@@ -80,4 +71,19 @@ func jumpWindows(all bool) error {
 		return err
 	}
 	return switchOrAttach(target)
+}
+
+// formatWindowPickerLine keeps the searched window as the first visible fzf
+// column while preserving field 1 as the hidden tmux target.
+func formatWindowPickerLine(w tmux.WindowInfo, current bool) string {
+	marker := "  "
+	if current {
+		marker = "● "
+	}
+	name := w.Name
+	if name == "" {
+		name = w.Label
+	}
+	window := fmt.Sprintf("%d:%s", w.Index, name)
+	return fmt.Sprintf("%s\t%s%-24s\t%s", w.Target, marker, window, w.Session)
 }
