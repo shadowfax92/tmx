@@ -20,87 +20,127 @@ var moveCmd = &cobra.Command{
 	Use:         "move [target-session]",
 	Aliases:     []string{"mv"},
 	Annotations: map[string]string{"group": "Navigate:"},
-	Short:       "Move the current window to another session",
-	Long: `Move the current tmux window to a different session.
+	Short:       "Move a selected window to another session",
+	Long: `Pick a tmux window, then move it to a different session.
 Creates the target session if it doesn't exist.
 
-  tmx move         — pick target session via fzf
-  tmx move admin   — move current window to "admin" (created if missing)
+  tmx move         — pick source window, then target session via fzf
+  tmx move admin   — pick source window, then move it to "admin" (created if missing)
   tmx mv ops       — same, with alias`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if !tmux.IsInsideTmux() {
-			return fmt.Errorf("tmx move must run inside tmux")
+		source, err := pickMoveWindow()
+		if err != nil {
+			return err
 		}
 
 		var target string
 		if len(args) == 1 {
 			target = args[0]
 		} else {
-			picked, err := pickMoveTarget()
+			picked, err := pickMoveTarget(source.Session)
 			if err != nil {
 				return err
 			}
 			target = picked
 		}
-		session, err := tmux.CurrentSession()
-		if err != nil {
-			return fmt.Errorf("reading current session: %w", err)
-		}
 
-		// Resolve against existing sessions: prefer the literal name, then a
-		// g/-prefixed match (the convention older sessions use). If neither
-		// exists we create the literal name as typed.
-		if !tmux.SessionExists(target) && tmux.SessionExists("g/"+target) {
-			target = "g/" + target
-		}
-
-		if session == target {
-			return fmt.Errorf("current window is already in %q", target)
-		}
-
-		created := false
-		if !tmux.SessionExists(target) {
-			home, _ := os.UserHomeDir()
-			if home == "" {
-				home = "/"
-			}
-			if err := tmux.NewSession(target, home); err != nil {
-				return fmt.Errorf("creating session %q: %w", target, err)
-			}
-			created = true
-		}
-
-		if err := tmux.MoveCurrentWindow(target); err != nil {
-			return fmt.Errorf("moving window: %w", err)
-		}
-
-		// A freshly created session has a placeholder window the moved window
-		// landed beside — kill it so the target isn't left with an empty shell.
-		if created {
-			_ = tmux.KillWindow("=" + target + ":1")
-		}
-
-		fmt.Printf("moved window to %s\n", target)
-		return nil
+		return moveSelectedWindow(source, target)
 	},
 }
 
-func pickMoveTarget() (string, error) {
+// moveSelectedWindow moves an already-selected source window into target. It
+// preserves the legacy conveniences of g/-prefix resolution and creating a
+// missing destination session.
+func moveSelectedWindow(source tmux.WindowInfo, target string) error {
+	if !tmux.SessionExists(target) && tmux.SessionExists("g/"+target) {
+		target = "g/" + target
+	}
+
+	if source.Session == target {
+		return fmt.Errorf("window %s is already in %q", source.Target, target)
+	}
+
+	created := false
+	if !tmux.SessionExists(target) {
+		home, _ := os.UserHomeDir()
+		if home == "" {
+			home = "/"
+		}
+		if err := tmux.NewSession(target, home); err != nil {
+			return fmt.Errorf("creating session %q: %w", target, err)
+		}
+		created = true
+	}
+
+	if err := tmux.MoveWindow(source.Target, target); err != nil {
+		return fmt.Errorf("moving window: %w", err)
+	}
+
+	// A freshly created session has a placeholder window the moved window
+	// landed beside — kill it so the target isn't left with an empty shell.
+	if created {
+		_ = tmux.KillWindow("=" + target + ":1")
+	}
+
+	fmt.Printf("moved %s to %s\n", source.Target, target)
+	return nil
+}
+
+// pickMoveWindow lets tmx move choose its source explicitly instead of relying
+// on the pane that invoked the command. Scratch windows stay hidden because
+// they are recreatable popups, not normal move sources.
+func pickMoveWindow() (tmux.WindowInfo, error) {
+	windows, err := tmux.ListWindowInfo()
+	if err != nil {
+		return tmux.WindowInfo{}, err
+	}
+	windows = moveSourceWindows(windows)
+	if len(windows) == 0 {
+		return tmux.WindowInfo{}, fmt.Errorf("no tmux windows to move")
+	}
+
+	lines := make([]string, 0, len(windows))
+	for _, w := range windows {
+		lines = append(lines, formatMoveWindowPickerLine(w))
+	}
+
+	target, err := runFzf("move window > ", lines, windowFzfArgs())
+	if err != nil {
+		return tmux.WindowInfo{}, err
+	}
+	for _, w := range windows {
+		if w.Target == target {
+			return w, nil
+		}
+	}
+	return tmux.WindowInfo{}, fmt.Errorf("selected window %q no longer exists", target)
+}
+
+func moveSourceWindows(windows []tmux.WindowInfo) []tmux.WindowInfo {
+	visible := make([]tmux.WindowInfo, 0, len(windows))
+	for _, w := range windows {
+		if scratch.IsSession(w.Session) {
+			continue
+		}
+		visible = append(visible, w)
+	}
+	return visible
+}
+
+func formatMoveWindowPickerLine(w tmux.WindowInfo) string {
+	return formatWindowPickerLine(w, false)
+}
+
+// pickMoveTarget chooses the destination session for a selected source window.
+// The printed query remains a create-new-session path for typed destinations.
+func pickMoveTarget(sourceSession string) (string, error) {
 	sessions, err := tmux.ListSessions()
 	if err != nil {
 		return "", err
 	}
 
-	current, _ := tmux.CurrentSession()
-
-	var lines []string
-	for _, s := range sessions {
-		if scratch.IsSession(s) || s == current {
-			continue
-		}
-		lines = append(lines, s)
-	}
+	lines := moveTargetSessions(sessions, sourceSession)
 
 	if len(lines) == 0 {
 		return "", fmt.Errorf("no other sessions to move to — pass a name to create one")
@@ -137,4 +177,15 @@ func pickMoveTarget() (string, error) {
 		return outputLines[0], nil
 	}
 	return "", ErrCancelled
+}
+
+func moveTargetSessions(sessions []string, sourceSession string) []string {
+	targets := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		if scratch.IsSession(s) || s == sourceSession {
+			continue
+		}
+		targets = append(targets, s)
+	}
+	return targets
 }

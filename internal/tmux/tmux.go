@@ -238,9 +238,16 @@ func UnsetSessionVar(session, key string) error {
 	return err
 }
 
-func MoveCurrentWindow(targetSession string) error {
-	_, err := run("move-window", "-t", "="+targetSession+":")
+// MoveWindow relocates a specific window into targetSession. The source is
+// explicit so callers can run from popups or unrelated panes without depending
+// on tmux's current-window resolution.
+func MoveWindow(sourceTarget, targetSession string) error {
+	_, err := run(moveWindowArgs(sourceTarget, targetSession)...)
 	return err
+}
+
+func moveWindowArgs(sourceTarget, targetSession string) []string {
+	return []string{"move-window", "-s", "=" + sourceTarget, "-t", "=" + targetSession + ":"}
 }
 
 func KillWindow(target string) error {

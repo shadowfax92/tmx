@@ -57,12 +57,7 @@ func sessionTree(all bool) error {
 		lines = append(lines, fmt.Sprintf("%s\t%s", row.defaultTarget, visible))
 	}
 
-	target, err := runFzf("session > ", lines, []string{
-		"--ansi",
-		"--with-nth", "2",
-		"--nth", "2",
-		"--tiebreak", "begin,index",
-	})
+	target, err := runFzf("session > ", lines, sessionTreeFzfArgs())
 	if err != nil {
 		return err
 	}

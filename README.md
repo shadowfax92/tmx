@@ -15,7 +15,7 @@
 - 🪄 **Scratch popups** — one keybind toggles a popup session (nvim, shell, lazygit, …) rooted at the current pane's directory. Config-driven: any command, any size.
 - 🧹 **One cleanup command** — `tmx reap` kills scratch sessions that are orphaned, idle past a TTL, or rooted in a directory that no longer exists. One `list-sessions` + one `list-panes`, so it's instant even with a big `gs/` backlog.
 - 🏷️ **Pane labels** — `tmx rename` labels the current pane from its git branch / repo / folder; `-w` renames the window too.
-- 🔀 **Move windows between sessions** — `tmx move <session>` relocates the current window, creating the target session if needed.
+- 🔀 **Move windows between sessions** — `tmx move` picks a source window and destination session, creating the target session if needed.
 - 🪶 **Self-contained** — a single Go binary, fzf for the picker, no shared library with grove.
 
 ---
@@ -48,7 +48,8 @@ tmx -w           # jump to a window (with live pane preview)
 tmx -p           # jump to a pane    (with live pane preview)
 tmx -a           # include scratch (gs/) sessions in any of the above
 
-tmx move admin   # move the current window to "admin" (created if missing)
+tmx move         # pick a window, then pick the session to move it into
+tmx move admin   # pick a window, then move it to "admin" (created if missing)
 tmx rename       # label the current pane from git/cwd
 tmx rename -w    # …and rename the window, disabling automatic-rename
 tmx rename --clear

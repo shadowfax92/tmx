@@ -60,13 +60,7 @@ func jumpWindows(all bool) error {
 		lines = append(lines, formatWindowPickerLine(w, w.Target == currentWindow))
 	}
 
-	target, err := runFzf("window > ", lines, []string{
-		"--with-nth", "2..",
-		"--nth", "2..",
-		"--tiebreak", "begin,index",
-		"--preview", "tmux capture-pane -ep -t {1}",
-		"--preview-window", "right:50%",
-	})
+	target, err := runFzf("window > ", lines, windowFzfArgs())
 	if err != nil {
 		return err
 	}

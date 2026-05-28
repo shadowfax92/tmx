@@ -51,12 +51,7 @@ func selectPane(all bool) (string, error) {
 		lines = append(lines, formatPanePickerLine(p, path, p.Target == current))
 	}
 
-	return runFzf("pane > ", lines, []string{
-		"--with-nth", "2..",
-		"--nth", "2..",
-		"--preview", "tmux capture-pane -ep -t {1}",
-		"--preview-window", "right:50%",
-	})
+	return runFzf("pane > ", lines, paneFzfArgs())
 }
 
 // formatPanePickerLine keeps the searched pane as the first visible fzf column
