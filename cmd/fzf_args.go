@@ -9,7 +9,6 @@ func sessionTreeFzfArgs() []string {
 		"--ansi",
 		"--ignore-case",
 		"--with-nth", "2",
-		"--nth", "2",
 		"--tiebreak", "begin,index",
 	}, fzfAbortBinds("alt-s")...)
 }
@@ -20,7 +19,6 @@ func windowFzfArgs() []string {
 	return append([]string{
 		"--ignore-case",
 		"--with-nth", "2..",
-		"--nth", "2..",
 		"--tiebreak", "begin,index",
 		"--preview", "tmux capture-pane -ep -t {1}",
 		"--preview-window", "right:50%",
@@ -33,7 +31,6 @@ func paneFzfArgs() []string {
 	return append([]string{
 		"--ignore-case",
 		"--with-nth", "2..",
-		"--nth", "2..",
 		"--preview", "tmux capture-pane -ep -t {1}",
 		"--preview-window", "right:50%",
 	}, fzfAbortBinds("alt-p")...)
