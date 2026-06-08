@@ -86,6 +86,39 @@ type ReapReport struct {
 	Failed  []ReapFailure
 }
 
+// Backend supplies the session operations used by scratch's state machine.
+type Backend interface {
+	SessionExists(name string) bool
+	NewSessionWithCommand(name, startDir string, env []string, command string) error
+	KillSession(name string) error
+	SetSessionVar(session, key, value string) error
+	GetSessionVar(session, key string) (string, error)
+	ListScratchSnapshots(prefix string) ([]tmux.ScratchSnapshot, error)
+	LivePaneIDs() (map[string]bool, error)
+}
+
+// WithBackend runs fn while scratch storage operations use backend.
+func WithBackend(backend Backend, fn func() error) error {
+	origList, origPanes := listScratchSnapshots, livePaneIDs
+	origGet, origSet := getSessionVar, setSessionVar
+	origExists, origNew, origKill := sessionExists, newSessionWithCommand, killSession
+	defer func() {
+		listScratchSnapshots, livePaneIDs = origList, origPanes
+		getSessionVar, setSessionVar = origGet, origSet
+		sessionExists, newSessionWithCommand, killSession = origExists, origNew, origKill
+	}()
+
+	listScratchSnapshots = backend.ListScratchSnapshots
+	livePaneIDs = backend.LivePaneIDs
+	getSessionVar = backend.GetSessionVar
+	setSessionVar = backend.SetSessionVar
+	sessionExists = backend.SessionExists
+	newSessionWithCommand = backend.NewSessionWithCommand
+	killSession = backend.KillSession
+
+	return fn()
+}
+
 type scratchSessionState struct {
 	name          string
 	typ           string
