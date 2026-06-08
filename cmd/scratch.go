@@ -5,8 +5,8 @@ import (
 	"strings"
 
 	"tmx/internal/config"
+	"tmx/internal/mux"
 	"tmx/internal/scratch"
-	"tmx/internal/tmux"
 
 	"github.com/spf13/cobra"
 )
@@ -35,10 +35,21 @@ The optional client/session/pane args are supplied by the tmux keybind that
 omitted they are resolved from the current tmux context.`,
 	Args: cobra.RangeArgs(1, 4),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if !tmux.IsInsideTmux() {
-			return fmt.Errorf("tmx scratch must run inside tmux")
-		}
+		return runScratch(args)
+	},
+}
 
+// runScratch toggles a configured scratch popup in the active multiplexer.
+func runScratch(args []string) error {
+	backend, err := mux.SelectScratchBackend()
+	if err != nil {
+		return err
+	}
+	return runScratchWithBackend(args, backend)
+}
+
+func runScratchWithBackend(args []string, backend mux.ScratchBackend) error {
+	return scratch.WithBackend(backend, func() error {
 		typ := args[0]
 		cfg, err := config.Load()
 		if err != nil {
@@ -49,7 +60,7 @@ omitted they are resolved from the current tmux context.`,
 				typ, strings.Join(cfg.Scratch.Types(), ", "))
 		}
 
-		clientName, currentSession, activePane, err := resolveScratchContext(args)
+		clientName, currentSession, activePane, err := resolveScratchContext(args, backend)
 		if err != nil {
 			return err
 		}
@@ -70,7 +81,7 @@ omitted they are resolved from the current tmux context.`,
 					return fmt.Errorf("storing scratch toggle timestamp: %w", err)
 				}
 			}
-			if err := tmux.ClosePopup(popupClient); err != nil {
+			if err := backend.ClosePopup(popupClient); err != nil {
 				return fmt.Errorf("closing popup: %w", err)
 			}
 			if currentSession == targetSession {
@@ -78,12 +89,12 @@ omitted they are resolved from the current tmux context.`,
 			}
 		}
 
-		if !tmux.PaneExists(parentPane) {
+		if !backend.PaneExists(parentPane) {
 			_, err := scratch.Reap(scratch.ReapOptions{})
 			return err
 		}
 
-		paneCwd, err := tmux.PaneCwd(parentPane)
+		paneCwd, err := backend.PaneCwd(parentPane)
 		if err != nil {
 			return fmt.Errorf("getting pane cwd: %w", err)
 		}
@@ -95,33 +106,31 @@ omitted they are resolved from the current tmux context.`,
 		if err := scratch.MarkToggled(targetSession); err != nil {
 			return fmt.Errorf("storing scratch toggle timestamp: %w", err)
 		}
-		if err := tmux.SetSessionVar(targetSession, "shadow_client_name", popupClient); err != nil {
+		if err := backend.SetSessionVar(targetSession, "shadow_client_name", popupClient); err != nil {
 			return fmt.Errorf("storing scratch client: %w", err)
 		}
 
-		attachCmd := fmt.Sprintf("exec tmux attach-session -t '=%s'", targetSession)
+		attachCmd := backend.PopupAttachCommand(targetSession)
 		size := cfg.Scratch.PopupFor(typ)
-		return tmux.DisplayPopup(popupClient, size.Width, size.Height, attachCmd)
-	},
+		return backend.DisplayPopup(popupClient, size.Width, size.Height, attachCmd)
+	})
 }
 
-// resolveScratchContext reads client/session/pane from positional args (passed
-// by the tmux keybind, where they're pre-interpolated and reliable) or resolves
-// them from the current tmux context when invoked by hand.
-func resolveScratchContext(args []string) (client, session, pane string, err error) {
+// resolveScratchContext reads explicit keybind context or asks the active backend.
+func resolveScratchContext(args []string, backend mux.ScratchBackend) (client, session, pane string, err error) {
 	if len(args) > 1 && args[1] != "" {
 		client = args[1]
-	} else if client, err = tmux.CurrentClient(); err != nil {
+	} else if client, err = backend.CurrentClient(); err != nil {
 		return "", "", "", fmt.Errorf("resolving client: %w", err)
 	}
 	if len(args) > 2 && args[2] != "" {
 		session = args[2]
-	} else if session, err = tmux.CurrentSession(); err != nil {
+	} else if session, err = backend.CurrentSession(); err != nil {
 		return "", "", "", fmt.Errorf("resolving session: %w", err)
 	}
 	if len(args) > 3 && args[3] != "" {
 		pane = args[3]
-	} else if pane, err = tmux.PaneID(); err != nil {
+	} else if pane, err = backend.PaneID(); err != nil {
 		return "", "", "", fmt.Errorf("resolving pane: %w", err)
 	}
 	return client, session, pane, nil
