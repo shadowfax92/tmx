@@ -30,9 +30,8 @@ from config (scratch.popups) — the command to run and the popup size.
 Toggling from outside the popup opens it; toggling from inside closes it. The
 popup follows the pane's project: if the pane's cwd changed, it is recreated.
 
-The optional client/session/pane args are supplied by the tmux keybind that
-'tmx init' installs (via #{client_name}/#{session_name}/#{pane_id}); when
-omitted they are resolved from the current tmux context.`,
+The optional client/session/pane args may be supplied by keybinds; when omitted
+they are resolved from the current multiplexer context.`,
 	Args: cobra.RangeArgs(1, 4),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runScratch(args)
