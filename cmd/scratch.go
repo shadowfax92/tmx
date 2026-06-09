@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"tmx/internal/config"
@@ -37,6 +38,8 @@ they are resolved from the current multiplexer context.`,
 		return runScratch(args)
 	},
 }
+
+const rmuxScratchContextEnv = "TMX_SCRATCH_CONTEXT"
 
 // runScratch toggles a configured scratch popup in the active multiplexer.
 func runScratch(args []string) error {
@@ -117,6 +120,9 @@ func runScratchWithBackend(args []string, backend mux.ScratchBackend) error {
 
 // resolveScratchContext reads explicit keybind context or asks the active backend.
 func resolveScratchContext(args []string, backend mux.ScratchBackend) (client, session, pane string, err error) {
+	if backend.Name() == "rmux" && len(args) > 1 && os.Getenv(rmuxScratchContextEnv) != "rmux" {
+		return "", "", "", fmt.Errorf("untrusted rmux scratch context; omit client/session/pane args or install rmux bindings with tmx init --rmux")
+	}
 	if len(args) > 1 && args[1] != "" {
 		client = args[1]
 	} else if client, err = backend.CurrentClient(); err != nil {

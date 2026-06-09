@@ -53,6 +53,48 @@ func TestRunScratchWithBackendOpensRmuxPopup(t *testing.T) {
 	}
 }
 
+func TestRunScratchWithBackendAcceptsTrustedRmuxKeybindContext(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TMUX", "")
+	t.Setenv("TMX_SCRATCH_CONTEXT", "rmux")
+
+	backend := newScratchFakeBackend("rmux")
+	backend.failCurrentLookups = true
+	backend.paneCwd = t.TempDir()
+	backend.livePanes = map[string]bool{"%9": true}
+
+	if err := runScratchWithBackend([]string{"vim", "123", "alpha", "%9"}, backend); err != nil {
+		t.Fatalf("runScratchWithBackend() error = %v", err)
+	}
+	if len(backend.newSessions) != 1 || backend.newSessions[0].name != "gs/vim/9" {
+		t.Fatalf("new sessions = %#v, want gs/vim/9", backend.newSessions)
+	}
+	if got := backend.sessionVar("gs/vim/9", "shadow_client_name"); got != "123" {
+		t.Fatalf("shadow_client_name = %q, want 123", got)
+	}
+}
+
+func TestRunScratchWithBackendRejectsUntrustedRmuxKeybindContext(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TMUX", "")
+	t.Setenv("TMX_SCRATCH_CONTEXT", "")
+
+	backend := newScratchFakeBackend("rmux")
+	backend.paneCwd = t.TempDir()
+	backend.livePanes = map[string]bool{"%9": true}
+
+	err := runScratchWithBackend([]string{"vim", "outer-client", "outer-session", "%9"}, backend)
+	if err == nil {
+		t.Fatal("runScratchWithBackend() error = nil, want untrusted context error")
+	}
+	if !strings.Contains(err.Error(), "untrusted rmux scratch context") {
+		t.Fatalf("error = %v, want untrusted context", err)
+	}
+	if len(backend.newSessions) != 0 || len(backend.popups) != 0 {
+		t.Fatalf("side effects: sessions=%#v popups=%#v, want none", backend.newSessions, backend.popups)
+	}
+}
+
 func TestRunScratchWithBackendClosesStoredRmuxPopupFromScratchSession(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("TMUX", "")

@@ -231,6 +231,13 @@ func runRmux(args ...string) (string, error) {
 	return runCommand("rmux", args...)
 }
 
+// BindRmuxKeyRaw installs an rmux key binding with caller-supplied arguments.
+func BindRmuxKeyRaw(args ...string) error {
+	fullArgs := append([]string{"bind-key"}, args...)
+	_, err := runRmux(fullArgs...)
+	return err
+}
+
 func defaultRunCommand(program string, args ...string) (string, error) {
 	cmd := exec.Command(program, args...)
 	out, err := cmd.CombinedOutput()

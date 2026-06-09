@@ -32,9 +32,17 @@ type Config struct {
 type ScratchConfig struct {
 	TTL      Duration             `yaml:"ttl"`
 	Keys     map[string]string    `yaml:"keys"`
+	RmuxKeys map[string]string    `yaml:"rmux_keys,omitempty"`
 	Popups   map[string]PopupSpec `yaml:"popups"`
 	Profiles []PopupProfile       `yaml:"profiles"`
 }
+
+type KeyTarget string
+
+const (
+	KeyTargetTmux KeyTarget = "tmux"
+	KeyTargetRmux KeyTarget = "rmux"
+)
 
 // PopupSpec defines one scratch type: the command to run (empty = login shell)
 // and the popup's default size.
@@ -159,6 +167,12 @@ scratch:
     vim: "M-v"
     sh: "M-b"
 
+  # Optional rmux-specific keybinds installed by 'tmx init --rmux'.
+  # Missing entries fall back to keys; empty entries skip that scratch type.
+  # rmux_keys:
+  #   vim: "M-I"
+  #   sh: "M-O"
+
   # Per-type popup definitions. cmd is what runs inside the popup
   # (empty cmd = a login shell). width/height size the popup.
   popups:
@@ -199,6 +213,16 @@ func (c ScratchConfig) CmdFor(typ string) string {
 func (c ScratchConfig) HasType(typ string) bool {
 	_, ok := c.Popups[typ]
 	return ok
+}
+
+// KeyFor returns the configured scratch key for the target multiplexer.
+func (c ScratchConfig) KeyFor(typ string, target KeyTarget) string {
+	if target == KeyTargetRmux {
+		if key, ok := c.RmuxKeys[typ]; ok {
+			return key
+		}
+	}
+	return c.Keys[typ]
 }
 
 // Types returns the configured scratch type names, sorted.
