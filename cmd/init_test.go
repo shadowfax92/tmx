@@ -1,7 +1,10 @@
 package cmd
 
 import (
+	"errors"
+	"io"
 	"slices"
+	"strings"
 	"testing"
 
 	"tmx/internal/config"
@@ -78,5 +81,48 @@ func TestInitPlanForRmuxDoesNotInstallJumpBindings(t *testing.T) {
 	}
 	if plan[0].typ != "vim" {
 		t.Fatalf("plan = %#v, want scratch binding only", plan)
+	}
+}
+
+func TestRunInitBindingsErrorsWhenAllPlannedBindingsFail(t *testing.T) {
+	bindings := []initBinding{{
+		key:  "M-i",
+		desc: "M-i  → scratch vim",
+		args: []string{"-n", "M-i"},
+	}}
+
+	bound, err := runInitBindings(bindings, func(args ...string) error {
+		return errors.New("no rmux server")
+	}, io.Discard)
+
+	if err == nil {
+		t.Fatal("runInitBindings() error = nil, want failure")
+	}
+	if !strings.Contains(err.Error(), "failed to bind 1 configured key") {
+		t.Fatalf("error = %v, want configured key count", err)
+	}
+	if len(bound) != 0 {
+		t.Fatalf("bound = %#v, want none", bound)
+	}
+}
+
+func TestRunInitBindingsKeepsPartialFailuresNonFatal(t *testing.T) {
+	bindings := []initBinding{
+		{key: "M-i", desc: "M-i  → scratch vim", args: []string{"fail"}},
+		{key: "M-o", desc: "M-o  → scratch sh", args: []string{"ok"}},
+	}
+
+	bound, err := runInitBindings(bindings, func(args ...string) error {
+		if args[0] == "fail" {
+			return errors.New("no rmux server")
+		}
+		return nil
+	}, io.Discard)
+
+	if err != nil {
+		t.Fatalf("runInitBindings() error = %v, want nil", err)
+	}
+	if !slices.Equal(bound, []string{"M-o  → scratch sh"}) {
+		t.Fatalf("bound = %#v, want only successful binding", bound)
 	}
 }

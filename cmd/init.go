@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 
@@ -54,7 +55,10 @@ Live binds don't survive a tmux server restart. To persist, add to ~/.tmux.conf:
 			bind = mux.BindRmuxKeyRaw
 		}
 		bindings := initBindings(cfg, self, initBindOptions{target: target, noJump: noJump})
-		bound := runInitBindings(bindings, bind, os.Stderr)
+		bound, err := runInitBindings(bindings, bind, os.Stderr)
+		if err != nil {
+			return err
+		}
 
 		if len(bound) == 0 {
 			fmt.Println("No keys bound. Configure", keyConfigHint(target), "in", configPathHint())
@@ -135,16 +139,21 @@ func jumpInitBindings(self string) []initBinding {
 	return bindings
 }
 
-func runInitBindings(bindings []initBinding, bind bindKeyFunc, errOut *os.File) []string {
+func runInitBindings(bindings []initBinding, bind bindKeyFunc, errOut io.Writer) ([]string, error) {
 	bound := make([]string, 0, len(bindings))
+	failures := 0
 	for _, binding := range bindings {
 		if err := bind(binding.args...); err != nil {
+			failures++
 			fmt.Fprintf(errOut, "warning: failed to bind %s (%s): %v\n", binding.key, binding.desc, err)
 			continue
 		}
 		bound = append(bound, binding.desc)
 	}
-	return bound
+	if len(bindings) > 0 && len(bound) == 0 && failures > 0 {
+		return bound, fmt.Errorf("failed to bind %d configured key(s); no keys installed", failures)
+	}
+	return bound, nil
 }
 
 func keyConfigHint(target config.KeyTarget) string {
