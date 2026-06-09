@@ -40,6 +40,13 @@ tmx init
 run-shell 'tmx init'
 ```
 
+If you also use rmux inside tmux, install rmux scratch bindings separately from
+inside a running rmux server:
+
+```sh
+tmx init --rmux
+```
+
 ## Usage
 
 ```sh
@@ -64,6 +71,7 @@ tmx reap --ttl 1h   # override the idle threshold
 tmx reap --all      # kill every scratch session
 
 tmx init         # (re)install the tmux keybindings
+tmx init --rmux  # install rmux scratch keybindings
 tmx config       # show the active width profile + resolved popup sizes
 tmx config --edit  # open the config in $EDITOR
 ```
@@ -94,6 +102,12 @@ scratch:
     vim: "M-v"
     sh: "M-b"
 
+  # Optional keys 'tmx init --rmux' binds inside rmux. Missing entries fall
+  # back to keys; empty entries skip that scratch type.
+  rmux_keys:
+    vim: "M-I"
+    sh: "M-O"
+
   # Per-type popups: the command to run (empty = login shell) and the size.
   popups:
     vim: { cmd: nvim, width: "80%", height: "95%" }
@@ -119,6 +133,12 @@ current width, the active profile, and the size each type resolves to.
 A scratch session is a throwaway tmux session named `gs/<type>/<pane-id>`, bound
 to the pane that opened it. The `gs/` prefix exists for one reason: navigation
 hides it from the default views (surface it with `-a`).
+
+When `tmx scratch` runs from an rmux-spawned process, it targets rmux instead of
+the outer tmux server. In nested rmux-inside-tmux setups, unchanged outer tmux
+`bind-key -n` bindings still belong to tmux and will not reach rmux. Use
+`tmx init --rmux` plus rmux-visible keys, usually via `scratch.rmux_keys`, for
+popups that open inside the rmux UI.
 
 Because scratch sessions are **recreatable** — rebuilt from the parent pane's
 cwd on the next toggle — aggressive reaping is safe. `tmx reap` kills a scratch
