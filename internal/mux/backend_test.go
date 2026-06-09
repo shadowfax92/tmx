@@ -127,6 +127,28 @@ func TestRmuxNewSessionWithCommandShape(t *testing.T) {
 	}
 }
 
+func TestBindRmuxKeyRawCommandShape(t *testing.T) {
+	var got commandCall
+	restore := stubRunCommand(t, func(program string, args ...string) (string, error) {
+		got = commandCall{program: program, args: append([]string(nil), args...)}
+		return "", nil
+	})
+	defer restore()
+
+	err := BindRmuxKeyRaw("-n", "M-I", "run-shell", "-b", `tmx scratch vim`)
+	if err != nil {
+		t.Fatalf("BindRmuxKeyRaw() error = %v", err)
+	}
+
+	want := commandCall{
+		program: "rmux",
+		args:    []string{"bind-key", "-n", "M-I", "run-shell", "-b", "tmx scratch vim"},
+	}
+	if got.program != want.program || !slices.Equal(got.args, want.args) {
+		t.Fatalf("call = %#v, want %#v", got, want)
+	}
+}
+
 type commandCall struct {
 	program string
 	args    []string

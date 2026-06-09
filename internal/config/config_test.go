@@ -51,6 +51,38 @@ func TestResolveSeedsUsableDefaults(t *testing.T) {
 	}
 }
 
+func TestScratchKeyForRmuxFallsBackToTmuxKey(t *testing.T) {
+	c := ScratchConfig{
+		Keys: map[string]string{"vim": "M-v"},
+	}
+
+	if got := c.KeyFor("vim", KeyTargetRmux); got != "M-v" {
+		t.Fatalf("KeyFor(rmux) = %q, want M-v", got)
+	}
+}
+
+func TestScratchKeyForRmuxUsesOverride(t *testing.T) {
+	c := ScratchConfig{
+		Keys:     map[string]string{"vim": "M-v"},
+		RmuxKeys: map[string]string{"vim": "M-I"},
+	}
+
+	if got := c.KeyFor("vim", KeyTargetRmux); got != "M-I" {
+		t.Fatalf("KeyFor(rmux) = %q, want M-I", got)
+	}
+}
+
+func TestScratchKeyForRmuxAllowsEmptyOverride(t *testing.T) {
+	c := ScratchConfig{
+		Keys:     map[string]string{"vim": "M-v"},
+		RmuxKeys: map[string]string{"vim": ""},
+	}
+
+	if got := c.KeyFor("vim", KeyTargetRmux); got != "" {
+		t.Fatalf("KeyFor(rmux) = %q, want empty", got)
+	}
+}
+
 func TestPopupForFallsBackToNinetyPercent(t *testing.T) {
 	c := ScratchConfig{Popups: map[string]PopupSpec{"vim": {Cmd: "nvim"}}}
 	size := c.PopupFor("vim")
