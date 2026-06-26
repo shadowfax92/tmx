@@ -114,3 +114,70 @@ func TestRmuxBackendForwardsWithoutPrefixing(t *testing.T) {
 		t.Fatalf("Plan() = %#v, want %#v", got, want)
 	}
 }
+
+func TestExitCurrentKillsPrefixedTmuxSession(t *testing.T) {
+	runner := &fakeRunner{outputs: []string{"rmx/codex/feat-example"}}
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, runner)
+
+	if err := client.ExitCurrent(); err != nil {
+		t.Fatalf("ExitCurrent() error = %v", err)
+	}
+
+	want := []recordedCall{
+		{program: "tmux", args: []string{"display-message", "-p", "#{session_name}"}},
+		{program: "tmux", args: []string{"kill-session", "-t", "=rmx/codex/feat-example"}},
+	}
+	if !callsEqual(runner.calls, want) {
+		t.Fatalf("calls = %#v, want %#v", runner.calls, want)
+	}
+}
+
+func TestExitCurrentRefusesNonPrefixedTmuxSession(t *testing.T) {
+	runner := &fakeRunner{outputs: []string{"main"}}
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, runner)
+
+	if err := client.ExitCurrent(); err == nil {
+		t.Fatal("ExitCurrent() error = nil, want refusal")
+	}
+
+	if len(runner.calls) != 1 {
+		t.Fatalf("calls = %#v, want only display-message", runner.calls)
+	}
+}
+
+type fakeRunner struct {
+	calls   []recordedCall
+	outputs []string
+}
+
+type recordedCall struct {
+	program string
+	args    []string
+}
+
+func (r *fakeRunner) Run(program string, args ...string) (string, error) {
+	r.calls = append(r.calls, recordedCall{program: program, args: append([]string(nil), args...)})
+	if len(r.outputs) == 0 {
+		return "", nil
+	}
+	out := r.outputs[0]
+	r.outputs = r.outputs[1:]
+	return out, nil
+}
+
+func (r *fakeRunner) RunInteractive(program string, args ...string) error {
+	r.calls = append(r.calls, recordedCall{program: program, args: append([]string(nil), args...)})
+	return nil
+}
+
+func callsEqual(got, want []recordedCall) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i].program != want[i].program || !slices.Equal(got[i].args, want[i].args) {
+			return false
+		}
+	}
+	return true
+}
