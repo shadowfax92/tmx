@@ -1,9 +1,8 @@
 // Package config owns tmx's YAML config at ~/.config/tmx/config.yaml.
 //
-// tmx only configures scratch popups, so the schema is a single `scratch`
-// block: a TTL for idle reaping, a per-type keybind map, a per-type popup
-// definition (command + size), and optional width-matched profiles that
-// override sizes for specific clients (e.g. a small laptop screen).
+// tmx configures scratch popups and detached workflow sessions. The `scratch`
+// block owns popup lifecycle settings; the `sessions` block chooses the backend
+// and namespace used by script-driven agent sessions.
 package config
 
 import (
@@ -20,13 +19,16 @@ import (
 )
 
 const (
-	DefaultTTL         = 6 * time.Hour
-	defaultPopupWidth  = "90%"
-	defaultPopupHeight = "90%"
+	DefaultTTL            = 6 * time.Hour
+	DefaultSessionBackend = "tmux"
+	DefaultSessionPrefix  = "rmx"
+	defaultPopupWidth     = "90%"
+	defaultPopupHeight    = "90%"
 )
 
 type Config struct {
-	Scratch ScratchConfig `yaml:"scratch"`
+	Scratch  ScratchConfig  `yaml:"scratch"`
+	Sessions SessionsConfig `yaml:"sessions"`
 }
 
 type ScratchConfig struct {
@@ -34,6 +36,11 @@ type ScratchConfig struct {
 	Keys     map[string]string    `yaml:"keys"`
 	Popups   map[string]PopupSpec `yaml:"popups"`
 	Profiles []PopupProfile       `yaml:"profiles"`
+}
+
+type SessionsConfig struct {
+	Backend string `yaml:"backend"`
+	Prefix  string `yaml:"prefix"`
 }
 
 // PopupSpec defines one scratch type: the command to run (empty = login shell)
@@ -136,6 +143,16 @@ func (c *Config) resolve() {
 	if c.Scratch.TTL <= 0 {
 		c.Scratch.TTL = Duration(DefaultTTL)
 	}
+	if strings.TrimSpace(c.Sessions.Backend) == "" {
+		c.Sessions.Backend = DefaultSessionBackend
+	} else {
+		c.Sessions.Backend = strings.TrimSpace(c.Sessions.Backend)
+	}
+	if strings.TrimSpace(c.Sessions.Prefix) == "" {
+		c.Sessions.Prefix = DefaultSessionPrefix
+	} else {
+		c.Sessions.Prefix = strings.Trim(strings.TrimSpace(c.Sessions.Prefix), "/")
+	}
 	if len(c.Scratch.Popups) == 0 {
 		c.Scratch.Popups = map[string]PopupSpec{
 			"vim": {Cmd: "nvim", Width: "80%", Height: "95%"},
@@ -147,8 +164,15 @@ func (c *Config) resolve() {
 	}
 }
 
-const defaultConfigBody = `# tmx configuration — scratch popup sessions
-# Docs: tmx scratch --help, tmx reap --help
+const defaultConfigBody = `# tmx configuration
+# Docs: tmx scratch --help, tmx reap --help, tmx rmx --help
+
+sessions:
+  # Backend for detached workflow sessions launched by scripts.
+  # tmux wraps the real tmux binary and stores physical sessions under rmx/.
+  # rmux forwards through the rmux binary for compatibility.
+  backend: tmux
+  prefix: rmx
 
 scratch:
   # Kill scratch sessions idle longer than this (units: s, m, h, or d for days).
