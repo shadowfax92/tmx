@@ -49,6 +49,39 @@ func TestResolveSeedsUsableDefaults(t *testing.T) {
 	if c.Scratch.Keys["vim"] != "M-v" || c.Scratch.Keys["sh"] != "M-b" {
 		t.Fatalf("expected seeded keys, got %v", c.Scratch.Keys)
 	}
+	if c.Sessions.Backend != DefaultSessionBackend {
+		t.Fatalf("default session backend = %q, want %q", c.Sessions.Backend, DefaultSessionBackend)
+	}
+	if c.Sessions.Prefix != DefaultSessionPrefix {
+		t.Fatalf("default session prefix = %q, want %q", c.Sessions.Prefix, DefaultSessionPrefix)
+	}
+}
+
+func TestResolvePreservesExplicitSessionConfig(t *testing.T) {
+	c := &Config{Sessions: SessionsConfig{Backend: "rmux", Prefix: "local"}}
+	c.resolve()
+
+	if c.Sessions.Backend != "rmux" {
+		t.Fatalf("session backend = %q, want rmux", c.Sessions.Backend)
+	}
+	if c.Sessions.Prefix != "local" {
+		t.Fatalf("session prefix = %q, want local", c.Sessions.Prefix)
+	}
+}
+
+func TestScratchOnlyYAMLGetsSessionDefaults(t *testing.T) {
+	var c Config
+	if err := yaml.Unmarshal([]byte("scratch:\n  ttl: 90m\n"), &c); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	c.resolve()
+
+	if c.Scratch.TTL.Duration() != 90*time.Minute {
+		t.Fatalf("scratch ttl = %v, want 90m", c.Scratch.TTL.Duration())
+	}
+	if c.Sessions.Backend != DefaultSessionBackend || c.Sessions.Prefix != DefaultSessionPrefix {
+		t.Fatalf("sessions = %+v, want defaults", c.Sessions)
+	}
 }
 
 func TestPopupForFallsBackToNinetyPercent(t *testing.T) {

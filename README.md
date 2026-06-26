@@ -63,6 +63,14 @@ tmx reap --dry-run  # preview what would be reaped
 tmx reap --ttl 1h   # override the idle threshold
 tmx reap --all      # kill every scratch session
 
+tmx rmx has-session -t codex/feat-example
+tmx rmx new-session -d -s codex/feat-example -c /tmp/work ./start-agent
+tmx rmx set-buffer -- "$PROMPT"
+tmx rmx paste-buffer -t codex/feat-example -p
+tmx rmx send-keys -t codex/feat-example Enter
+tmx rmx attach-session -t codex/feat-example
+tmx rmx exit       # close the current rmx/ workflow session
+
 tmx init         # (re)install the tmux keybindings
 tmx config       # show the active width profile + resolved popup sizes
 tmx config --edit  # open the config in $EDITOR
@@ -85,6 +93,13 @@ Pass `tmx init --no-jump` to skip the `M-s/M-w/M-p` binds.
 Location: `~/.config/tmx/config.yaml` (created on first run).
 
 ```yaml
+sessions:
+  # Backend for detached workflow sessions launched by scripts.
+  # tmux wraps the real tmux binary and stores physical sessions under rmx/.
+  # rmux forwards through the rmux binary for compatibility.
+  backend: tmux
+  prefix: rmx
+
 scratch:
   # Kill scratch sessions idle longer than this (s, m, h, or d for days).
   ttl: 6h
@@ -113,6 +128,23 @@ scratch:
 Profiles are matched against the tmux client width (`#{client_width}`), first
 match wins; force one with `TMX_PROFILE=<name>`. Run `tmx config` to see the
 current width, the active profile, and the size each type resolves to.
+
+## Workflow sessions
+
+`tmx rmx` is a small script-facing adapter for detached agent workflows. With
+the default `sessions.backend: tmux`, it shells out to the real `tmux` binary
+and maps logical workflow names to physical tmux sessions under the configured
+prefix:
+
+```sh
+tmx rmx --dry-run new-session -d -s codex/feat-example -c /tmp/work ./start-agent
+# + tmux new-session -d -s rmx/codex/feat-example -c /tmp/work ./start-agent
+```
+
+Target commands such as `has-session`, `paste-buffer`, `send-keys`,
+`attach-session`, and `kill-session` use exact tmux targets after mapping so
+regular tmux sessions are not matched accidentally. Set `sessions.backend:
+rmux` to forward the same raw command surface through `rmux` unchanged.
 
 ## How scratch popups work
 
