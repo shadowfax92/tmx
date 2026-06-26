@@ -102,6 +102,25 @@ func TestTmuxTargetMappingAvoidsDoublePrefix(t *testing.T) {
 	}
 }
 
+func TestNewSessionDoesNotRewriteLauncherFlags(t *testing.T) {
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, nil)
+
+	got, err := client.Plan([]string{
+		"new-session", "-d", "-s", "codex/feat-example", "-c", "/tmp/work",
+		"./launcher", "-t", "raw-target", "-s", "raw-session",
+	})
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	want := []string{
+		"new-session", "-d", "-s", "rmx/codex/feat-example", "-c", "/tmp/work",
+		"./launcher", "-t", "raw-target", "-s", "raw-session",
+	}
+	if !slices.Equal(got.Args, want) {
+		t.Fatalf("Args = %#v, want %#v", got.Args, want)
+	}
+}
+
 func TestRmuxBackendForwardsWithoutPrefixing(t *testing.T) {
 	client := New(config.SessionsConfig{Backend: "rmux", Prefix: "rmx"}, nil)
 
@@ -142,6 +161,32 @@ func TestExitCurrentRefusesNonPrefixedTmuxSession(t *testing.T) {
 
 	if len(runner.calls) != 1 {
 		t.Fatalf("calls = %#v, want only display-message", runner.calls)
+	}
+}
+
+func TestExitCurrentRefusesBarePrefixTmuxSession(t *testing.T) {
+	runner := &fakeRunner{outputs: []string{"rmx"}}
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, runner)
+
+	if err := client.ExitCurrent(); err == nil {
+		t.Fatal("ExitCurrent() error = nil, want refusal")
+	}
+
+	if len(runner.calls) != 1 {
+		t.Fatalf("calls = %#v, want only display-message", runner.calls)
+	}
+}
+
+func TestListSessionsFiltersBarePrefixSession(t *testing.T) {
+	runner := &fakeRunner{outputs: []string{"rmx\trmx\nrmx/codex/feat-example\trmx/codex/feat-example"}}
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, runner)
+
+	got, err := client.Run([]string{"list-sessions", "-F", "#{session_name}"})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if got != "codex/feat-example" {
+		t.Fatalf("Run() = %q, want only logical prefixed session", got)
 	}
 }
 

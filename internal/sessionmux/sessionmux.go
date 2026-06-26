@@ -57,7 +57,7 @@ func (c Client) PhysicalSessionName(name string) string {
 
 func (c Client) IsPhysicalSessionName(name string) bool {
 	name = strings.TrimPrefix(strings.TrimSpace(name), "=")
-	return c.prefix != "" && (name == c.prefix || strings.HasPrefix(name, c.prefix+"/"))
+	return c.prefix != "" && strings.HasPrefix(name, c.prefix+"/")
 }
 
 func (c Client) Plan(args []string) (Command, error) {
@@ -143,7 +143,7 @@ func (c Client) planTmux(args []string) Command {
 
 	switch command {
 	case "new-session":
-		mapFlagValues(mapped, map[string]func(string) string{
+		mapNewSessionFlagValues(mapped, map[string]func(string) string{
 			"-s": c.PhysicalSessionName,
 			"-t": func(value string) string { return c.physicalTarget(value, true) },
 		})
@@ -210,6 +210,39 @@ func mapFlagValues(args []string, mappers map[string]func(string) string) {
 		}
 		args[i+1] = mapper(args[i+1])
 		i++
+	}
+}
+
+func mapNewSessionFlagValues(args []string, mappers map[string]func(string) string) {
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return
+		}
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			return
+		}
+
+		if mapper, ok := mappers[arg]; ok {
+			if i+1 >= len(args) {
+				return
+			}
+			args[i+1] = mapper(args[i+1])
+			i++
+			continue
+		}
+		if newSessionOptionConsumesValue(arg) {
+			i++
+		}
+	}
+}
+
+func newSessionOptionConsumesValue(arg string) bool {
+	switch arg {
+	case "-c", "-e", "-F", "-n", "-x", "-y":
+		return true
+	default:
+		return false
 	}
 }
 
