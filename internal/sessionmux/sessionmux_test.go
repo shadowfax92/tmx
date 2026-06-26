@@ -131,6 +131,22 @@ func TestCompactNewSessionNameFlagIsRejected(t *testing.T) {
 	}
 }
 
+func TestUnsupportedTmuxCommandIsRejected(t *testing.T) {
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, nil)
+
+	if _, err := client.Plan([]string{"rename-session", "-t", "codex/feat-example", "new-name"}); err == nil {
+		t.Fatal("Plan() error = nil, want unsupported command rejection")
+	}
+}
+
+func TestUnsupportedAliasIsRejected(t *testing.T) {
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, nil)
+
+	if _, err := client.Plan([]string{"send", "-t", "codex/feat-example", "Enter"}); err == nil {
+		t.Fatal("Plan() error = nil, want unsupported alias rejection")
+	}
+}
+
 func TestNewSessionSkipsFlagValueBeforeSessionName(t *testing.T) {
 	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, nil)
 

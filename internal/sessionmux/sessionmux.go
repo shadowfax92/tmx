@@ -139,6 +139,9 @@ func (c Client) ExitCurrent() error {
 
 func (c Client) planTmux(args []string) (Command, error) {
 	command := canonicalCommand(args[0])
+	if !isSupportedTmuxCommand(command) {
+		return Command{}, fmt.Errorf("unsupported tmx rmx command %q for tmux backend", args[0])
+	}
 	mapped := append([]string{args[0]}, args[1:]...)
 
 	switch command {
@@ -334,6 +337,15 @@ func commandTargetKind(command string) (targetKind, bool) {
 func isInteractive(command string) bool {
 	switch canonicalCommand(command) {
 	case "attach-session":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSupportedTmuxCommand(command string) bool {
+	switch canonicalCommand(command) {
+	case "has-session", "new-session", "set-buffer", "paste-buffer", "send-keys", "attach-session", "kill-session", "list-sessions", "capture-pane", "display-message", "set-option", "show-options":
 		return true
 	default:
 		return false
