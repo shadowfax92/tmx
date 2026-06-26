@@ -50,12 +50,12 @@ func TestTmuxCommandShapesForSfAutoMuxSubset(t *testing.T) {
 		{
 			name:     "paste buffer",
 			input:    []string{"paste-buffer", "-t", "codex/feat-example", "-p"},
-			wantArgs: []string{"paste-buffer", "-t", "=rmx/codex/feat-example", "-p"},
+			wantArgs: []string{"paste-buffer", "-t", "=rmx/codex/feat-example:", "-p"},
 		},
 		{
 			name:     "send enter",
 			input:    []string{"send-keys", "-t", "codex/feat-example", "Enter"},
-			wantArgs: []string{"send-keys", "-t", "=rmx/codex/feat-example", "Enter"},
+			wantArgs: []string{"send-keys", "-t", "=rmx/codex/feat-example:", "Enter"},
 		},
 		{
 			name:        "attach",
@@ -96,9 +96,64 @@ func TestTmuxTargetMappingAvoidsDoublePrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Plan() error = %v", err)
 	}
-	want := []string{"send-keys", "-t", "=rmx/codex/feat-example", "Enter"}
+	want := []string{"send-keys", "-t", "=rmx/codex/feat-example:", "Enter"}
 	if !slices.Equal(got.Args, want) {
 		t.Fatalf("Args = %#v, want %#v", got.Args, want)
+	}
+}
+
+func TestPaneTargetMappingPreservesExplicitSuffix(t *testing.T) {
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, nil)
+
+	got, err := client.Plan([]string{"send-keys", "-t", "codex/feat-example:2.0", "Enter"})
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	want := []string{"send-keys", "-t", "=rmx/codex/feat-example:2.0", "Enter"}
+	if !slices.Equal(got.Args, want) {
+		t.Fatalf("Args = %#v, want %#v", got.Args, want)
+	}
+}
+
+func TestCompactTargetFlagIsRejected(t *testing.T) {
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, nil)
+
+	if _, err := client.Plan([]string{"has-session", "-tcodex/feat-example"}); err == nil {
+		t.Fatal("Plan() error = nil, want compact -t rejection")
+	}
+}
+
+func TestCompactNewSessionNameFlagIsRejected(t *testing.T) {
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, nil)
+
+	if _, err := client.Plan([]string{"new-session", "-ds", "codex/feat-example"}); err == nil {
+		t.Fatal("Plan() error = nil, want compact -s rejection")
+	}
+}
+
+func TestNewSessionSkipsFlagValueBeforeSessionName(t *testing.T) {
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, nil)
+
+	got, err := client.Plan([]string{"new-session", "-f", "ignore-size", "-s", "codex/feat-example"})
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	want := []string{"new-session", "-f", "ignore-size", "-s", "rmx/codex/feat-example"}
+	if !slices.Equal(got.Args, want) {
+		t.Fatalf("Args = %#v, want %#v", got.Args, want)
+	}
+}
+
+func TestDryRunQuotesLeadingEqualsTarget(t *testing.T) {
+	client := New(config.SessionsConfig{Backend: "tmux", Prefix: "rmx"}, nil)
+
+	got, err := client.DryRunLine([]string{"has-session", "-t", "codex/feat-example"})
+	if err != nil {
+		t.Fatalf("DryRunLine() error = %v", err)
+	}
+	want := "+ tmux has-session -t '=rmx/codex/feat-example'"
+	if got != want {
+		t.Fatalf("DryRunLine() = %q, want %q", got, want)
 	}
 }
 

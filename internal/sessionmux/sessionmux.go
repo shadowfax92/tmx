@@ -67,7 +67,7 @@ func (c Client) Plan(args []string) (Command, error) {
 
 	switch c.backend {
 	case "tmux":
-		return c.planTmux(args), nil
+		return c.planTmux(args)
 	case "rmux":
 		return Command{Program: "rmux", Args: append([]string(nil), args...), Interactive: isInteractive(args[0])}, nil
 	default:
@@ -137,25 +137,29 @@ func (c Client) ExitCurrent() error {
 	}
 }
 
-func (c Client) planTmux(args []string) Command {
+func (c Client) planTmux(args []string) (Command, error) {
 	command := canonicalCommand(args[0])
 	mapped := append([]string{args[0]}, args[1:]...)
 
 	switch command {
 	case "new-session":
-		mapNewSessionFlagValues(mapped, map[string]func(string) string{
+		if err := mapNewSessionFlagValues(mapped, map[string]func(string) string{
 			"-s": c.PhysicalSessionName,
-			"-t": func(value string) string { return c.physicalTarget(value, true) },
-		})
+			"-t": func(value string) string { return c.physicalTarget(value, true, targetSession) },
+		}); err != nil {
+			return Command{}, err
+		}
 	default:
-		if mapsTargetFlag(command) {
-			mapFlagValues(mapped, map[string]func(string) string{
-				"-t": func(value string) string { return c.physicalTarget(value, true) },
-			})
+		if kind, ok := commandTargetKind(command); ok {
+			if err := mapFirstTargetFlag(mapped, func(value string) string {
+				return c.physicalTarget(value, true, kind)
+			}); err != nil {
+				return Command{}, err
+			}
 		}
 	}
 
-	return Command{Program: "tmux", Args: mapped, Interactive: isInteractive(command)}
+	return Command{Program: "tmux", Args: mapped, Interactive: isInteractive(command)}, nil
 }
 
 func (c Client) runTmuxListSessions(args []string) (string, error) {
@@ -199,33 +203,46 @@ func listSessionsFormat(args []string) (string, []string) {
 	return format, rest
 }
 
-func mapFlagValues(args []string, mappers map[string]func(string) string) {
-	for i := 1; i < len(args); i++ {
-		if args[i] == "--" {
-			return
-		}
-		mapper, ok := mappers[args[i]]
-		if !ok || i+1 >= len(args) {
-			continue
-		}
-		args[i+1] = mapper(args[i+1])
-		i++
-	}
-}
-
-func mapNewSessionFlagValues(args []string, mappers map[string]func(string) string) {
+func mapFirstTargetFlag(args []string, mapper func(string) string) error {
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
-			return
+			return nil
+		}
+		if hasCompactFlag(arg, 't') {
+			return fmt.Errorf("compact -t targets are not supported; use -t <target>")
+		}
+		if arg != "-t" {
+			continue
+		}
+		if i+1 >= len(args) {
+			return fmt.Errorf("missing value for -t")
+		}
+		args[i+1] = mapper(args[i+1])
+		return nil
+	}
+	return nil
+}
+
+func mapNewSessionFlagValues(args []string, mappers map[string]func(string) string) error {
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return nil
 		}
 		if !strings.HasPrefix(arg, "-") || arg == "-" {
-			return
+			return nil
+		}
+		if hasCompactFlag(arg, 's') {
+			return fmt.Errorf("compact -s session names are not supported; use -s <session>")
+		}
+		if hasCompactFlag(arg, 't') {
+			return fmt.Errorf("compact -t targets are not supported; use -t <target>")
 		}
 
 		if mapper, ok := mappers[arg]; ok {
 			if i+1 >= len(args) {
-				return
+				return fmt.Errorf("missing value for %s", arg)
 			}
 			args[i+1] = mapper(args[i+1])
 			i++
@@ -235,18 +252,26 @@ func mapNewSessionFlagValues(args []string, mappers map[string]func(string) stri
 			i++
 		}
 	}
+	return nil
 }
 
 func newSessionOptionConsumesValue(arg string) bool {
 	switch arg {
-	case "-c", "-e", "-F", "-n", "-x", "-y":
+	case "-c", "-e", "-F", "-f", "-n", "-x", "-y":
 		return true
 	default:
 		return false
 	}
 }
 
-func (c Client) physicalTarget(target string, exact bool) string {
+type targetKind int
+
+const (
+	targetSession targetKind = iota
+	targetPane
+)
+
+func (c Client) physicalTarget(target string, exact bool, kind targetKind) string {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return target
@@ -259,6 +284,9 @@ func (c Client) physicalTarget(target string, exact bool) string {
 	}
 
 	session, suffix := splitTarget(raw)
+	if kind == targetPane && suffix == "" {
+		suffix = ":"
+	}
 	mapped := c.PhysicalSessionName(session) + suffix
 	if exact || alreadyExact {
 		return "=" + strings.TrimPrefix(mapped, "=")
@@ -285,12 +313,21 @@ func isSpecialTarget(target string) bool {
 	}
 }
 
-func mapsTargetFlag(command string) bool {
-	switch canonicalCommand(command) {
-	case "has-session", "attach-session", "kill-session", "paste-buffer", "send-keys", "capture-pane", "display-message", "set-option", "show-options":
-		return true
-	default:
+func hasCompactFlag(arg string, flag byte) bool {
+	if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") || len(arg) <= 2 {
 		return false
+	}
+	return strings.ContainsRune(arg[1:], rune(flag))
+}
+
+func commandTargetKind(command string) (targetKind, bool) {
+	switch canonicalCommand(command) {
+	case "has-session", "attach-session", "kill-session", "set-option", "show-options":
+		return targetSession, true
+	case "paste-buffer", "send-keys", "capture-pane", "display-message":
+		return targetPane, true
+	default:
+		return targetSession, false
 	}
 }
 
@@ -347,6 +384,9 @@ func shellQuote(s string) string {
 }
 
 func isShellSafe(s string) bool {
+	if strings.HasPrefix(s, "=") {
+		return false
+	}
 	for _, r := range s {
 		switch {
 		case r >= 'a' && r <= 'z':
