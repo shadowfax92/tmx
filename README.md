@@ -129,9 +129,11 @@ when any of these holds:
 - **idle** — untouched longer than `scratch.ttl`
 
 Reaping is a manual sweep — run `tmx reap` (or `tmx reap --dry-run` to preview)
-when the `gs/` namespace gets cluttered. It deliberately does **not** run on
-toggle: that put a full namespace scan on the popup-open hot path, which got
-slow with a large backlog. To automate it, wrap `tmx reap` in a cron/`loop`.
+when the `gs/` namespace gets cluttered. Normal toggles deliberately do **not**
+run a full namespace scan: that put the popup-open hot path on the size of the
+`gs/` backlog. A toggle from a stale scratch whose stored parent pane is already
+gone may run the same orphan/dead-cwd cleanup before returning. To automate
+regular idle cleanup, wrap `tmx reap` in a cron/`loop`.
 
 > Scratch sessions keep grove's `gs/` prefix and `shadow_*` session vars, so a
 > previous grove install's popups are adopted automatically. The shell env

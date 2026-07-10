@@ -29,8 +29,9 @@ var reapCmd = &cobra.Command{
   dead-cwd — the session's start directory no longer exists
   idle     — untouched longer than scratch.ttl (config, default 6h)
 
-This also runs automatically on every scratch toggle, so the namespace
-self-heals during normal use.
+Reaping is an explicit sweep; normal scratch toggles do not scan the namespace.
+If a scratch popup's stored parent pane is already gone, the toggle path may run
+the same orphan/dead-cwd cleanup before returning.
 
   tmx reap              — reap orphan + dead-cwd + idle(>ttl)
   tmx reap --dry-run    — show what would be reaped
