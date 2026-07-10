@@ -289,7 +289,7 @@ func Reap(opts ReapOptions) (ReapReport, error) {
 // list-sessions (with the @shadow_* vars expanded inline) and one list-panes
 // for orphan detection. This is deliberately O(1) in tmux invocations — an
 // earlier version did ~2 show-options per session, which made reap (and the
-// since-removed reap-on-toggle) scale badly with session count.
+// since-removed full reap-on-toggle path) scale badly with session count.
 func listScratchSessions() ([]scratchSessionState, error) {
 	snapshots, err := listScratchSnapshots(Prefix + "/")
 	if err != nil {

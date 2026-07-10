@@ -79,6 +79,56 @@ func TestRunScratchWithBackendClosesStoredRmuxPopupFromScratchSession(t *testing
 	}
 }
 
+func TestRunScratchWithBackendDoesNotReapNamespaceOnNormalToggle(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TMUX", "")
+
+	backend := newScratchFakeBackend("tmux")
+	backend.currentSession = "alpha"
+	backend.paneID = "%9"
+	backend.paneCwd = t.TempDir()
+	backend.livePanes = map[string]bool{"%9": true}
+	backend.setSessionVarValue("gs/sh/stale", "shadow_parent_pane", "%gone")
+	backend.setSessionVarValue("gs/sh/stale", "shadow_cwd", t.TempDir())
+
+	if err := runScratchWithBackend([]string{"vim"}, backend); err != nil {
+		t.Fatalf("runScratchWithBackend() error = %v", err)
+	}
+	if _, ok := backend.vars["gs/sh/stale"]; !ok {
+		t.Fatal("normal toggle reaped unrelated stale scratch session")
+	}
+	if _, ok := backend.vars["gs/vim/9"]; !ok {
+		t.Fatalf("target scratch session was not created: %#v", backend.vars)
+	}
+}
+
+func TestRunScratchWithBackendReapsWhenStoredParentPaneIsGone(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TMUX", "")
+
+	backend := newScratchFakeBackend("tmux")
+	backend.currentClient = "123"
+	backend.currentSession = "gs/vim/9"
+	backend.paneID = "%99"
+	backend.livePanes = map[string]bool{}
+	backend.setSessionVarValue("gs/vim/9", "shadow_client_name", "123")
+	backend.setSessionVarValue("gs/vim/9", "shadow_parent_pane", "%9")
+	backend.setSessionVarValue("gs/vim/9", "shadow_cwd", t.TempDir())
+
+	if err := runScratchWithBackend([]string{"sh"}, backend); err != nil {
+		t.Fatalf("runScratchWithBackend() error = %v", err)
+	}
+	if _, ok := backend.vars["gs/vim/9"]; ok {
+		t.Fatalf("stale scratch session was not reaped: %#v", backend.vars)
+	}
+	if !slices.Equal(backend.closedPopups, []string{"123"}) {
+		t.Fatalf("closed popups = %#v, want [123]", backend.closedPopups)
+	}
+	if len(backend.newSessions) != 0 || len(backend.popups) != 0 {
+		t.Fatalf("unexpected open work: newSessions=%#v popups=%#v", backend.newSessions, backend.popups)
+	}
+}
+
 func TestRunScratchWithBackendUsesExplicitKeybindContext(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("TMUX", "")

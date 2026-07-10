@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +49,30 @@ func TestResolveSeedsUsableDefaults(t *testing.T) {
 	}
 	if c.Scratch.Keys["vim"] != "M-v" || c.Scratch.Keys["sh"] != "M-b" {
 		t.Fatalf("expected seeded keys, got %v", c.Scratch.Keys)
+	}
+}
+
+func TestLoadCreatesStarterConfigWithSixHourTTL(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Scratch.TTL.Duration() != DefaultTTL {
+		t.Fatalf("TTL = %v, want %v", cfg.Scratch.TTL.Duration(), DefaultTTL)
+	}
+
+	path, err := DefaultConfigPath()
+	if err != nil {
+		t.Fatalf("DefaultConfigPath() error = %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v", path, err)
+	}
+	if !strings.Contains(string(data), "ttl: 6h") {
+		t.Fatalf("starter config missing ttl: 6h:\n%s", string(data))
 	}
 }
 
