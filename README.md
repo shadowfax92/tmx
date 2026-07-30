@@ -4,11 +4,11 @@
 
 **Get around tmux — and know which agent needs you next.**
 
-*A colored session tree, window/pane jump with live previews, agent attention queue, pane labels, and recreatable scratch popups. No worktrees or state file.*
+*A colored session tree, window/pane jump with live previews, agent attention queue, pane labels, and recreatable scratch popups. Live attention state stays in tmux.*
 
 </div>
 
-`tmx` is the navigation half of [grove](https://github.com/shadowfax92/grove), carved out into its own tool. grove owns git worktrees; `tmx` owns *getting around tmux*: a session tree you land on, fuzzy jump to any window or pane, moving and labeling what's in front of you, and **scratch popups** — recreatable vim/shell/lazygit overlays bound to the current pane. It talks only to `tmux` (and to `git` once, to guess a pane label). It never reads grove's config or state.
+`tmx` is the tmux companion to [grove](https://github.com/shadowfax92/grove), carved out into its own tool. grove owns git worktrees; `tmx` owns *getting around tmux and keeping track of agent panes*: a session tree you land on, fuzzy jump to any window or pane, attention state, moving and labeling what's in front of you, and **scratch popups** — recreatable vim/shell/lazygit overlays bound to the current pane. It never reads grove's config or state.
 
 - 🌳 **Session tree as the landing view** — `tmx` opens a colored tree of your sessions grouped by `/`, each annotated with the command it's running. Pick one, switch to it.
 - 🔭 **Jump to any window or pane** — `tmx -w` / `tmx -p` fuzzy-search every window/pane with a live `capture-pane` preview on the right.
@@ -165,6 +165,10 @@ It discovers panes whose process tree contains a configured agent, excluding
 scratch (`gs/`) sessions and `@fip_buffer` panes. Every `poll`, it hashes the
 last `capture_lines` lines. A stable pane becomes unread after
 `grace_periods × period` (90 seconds by default), once per quiet episode.
+Live pane/window state stays in tmux; watcher lifecycle files (`watch.pid`,
+`watch.lock`, and `watch.log`) live in a per-socket directory below
+`~/.local/state/tmx/` by default. `TMX_STATE_DIR` or `XDG_STATE_HOME` can
+override that location.
 
 Visiting an unread pane clears it within one watcher tick; `tmx jump` clears it
 immediately. New screen activity re-arms the episode. `tmx snooze` gives the
