@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -126,12 +127,17 @@ func runInbox(w io.Writer, options inboxOptions, deps inboxDeps) error {
 	entries := make([]inboxEntry, 0, len(states))
 	for _, state := range states {
 		entry := makeInboxEntry(state, deps.now())
-		if !options.quiet {
+		if !options.quiet || options.json {
 			captured, err := deps.capture(state.ID, 0)
 			if err != nil {
-				// Snapshot is a live inventory; capture failures normally mean
-				// this pane disappeared between the two tmux calls.
-				continue
+				live, liveErr := inboxPaneIsLive(state.ID, deps.snapshot)
+				if liveErr != nil {
+					err = errors.Join(err, fmt.Errorf("rechecking pane inventory: %w", liveErr))
+				}
+				if live || liveErr != nil {
+					return fmt.Errorf("capturing pane %s: %w", entry.Target, err)
+				}
+				continue // Pane disappeared between snapshot and capture.
 			}
 			entry.LastLine = lastNonEmptyScreenLine(captured)
 		}
@@ -184,6 +190,22 @@ func runInbox(w io.Writer, options inboxOptions, deps inboxDeps) error {
 		return fmt.Errorf("pane %s is no longer available", selected)
 	}
 	return nil
+}
+
+func inboxPaneIsLive(
+	paneID string,
+	snapshot func() ([]attn.PaneState, error),
+) (bool, error) {
+	states, err := snapshot()
+	if err != nil {
+		return false, err
+	}
+	for _, state := range states {
+		if state.ID == paneID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func watchedInboxStates(states []attn.PaneState) []attn.PaneState {

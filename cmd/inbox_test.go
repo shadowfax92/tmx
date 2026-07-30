@@ -13,6 +13,8 @@ import (
 	"tmx/internal/attn"
 	"tmx/internal/config"
 	"tmx/internal/tmux"
+
+	"github.com/spf13/cobra"
 )
 
 func TestInboxPlainListsLiveAttentionPanesInPriorityOrder(t *testing.T) {
@@ -36,6 +38,20 @@ func TestInboxPlainListsLiveAttentionPanesInPriorityOrder(t *testing.T) {
 		"%unwatched": "finished",
 	}
 	deps := fakeInboxDeps(states, captures)
+	snapshotCalls := 0
+	deps.snapshot = func() ([]attn.PaneState, error) {
+		snapshotCalls++
+		if snapshotCalls == 1 {
+			return append([]attn.PaneState(nil), states...), nil
+		}
+		var live []attn.PaneState
+		for _, state := range states {
+			if state.ID != "%gone" {
+				live = append(live, state)
+			}
+		}
+		return live, nil
+	}
 	deps.capture = func(target string, history int) (string, error) {
 		if history != 0 {
 			t.Fatalf("capture history = %d, want visible screen only", history)
@@ -94,7 +110,7 @@ func TestInboxJSONAndQuietAreScriptFriendly(t *testing.T) {
 			return "", nil
 		}
 
-		output, err := executeInboxCommand(newInboxCommandWithDeps(deps), "--json")
+		output, err := executeInboxCommand(newInboxCommandWithDeps(deps), "--json", "-q")
 		if err != nil {
 			t.Fatalf("inbox --json error = %v", err)
 		}
@@ -140,6 +156,24 @@ func TestInboxJSONAndQuietAreScriptFriendly(t *testing.T) {
 			t.Fatalf("quiet output captured %d panes, want none", captureCalls)
 		}
 	})
+}
+
+func TestInboxReturnsCaptureFailureForPaneStillLive(t *testing.T) {
+	state := inboxState("%1", "work:1.0", attn.StateActive, true, 900, "build", "agent")
+	deps := fakeInboxDeps([]attn.PaneState{state}, nil)
+	deps.capture = func(string, int) (string, error) {
+		return "", errors.New("capture unavailable")
+	}
+
+	output, err := executeInboxCommand(newInboxCommandWithDeps(deps))
+	if err == nil ||
+		!strings.Contains(err.Error(), "capturing pane work:1.0") ||
+		!strings.Contains(err.Error(), "capture unavailable") {
+		t.Fatalf("capture error = %v, want contextual live-pane failure", err)
+	}
+	if output != "" {
+		t.Fatalf("capture failure output = %q, want none", output)
+	}
 }
 
 func TestInboxTTYUsesPanePreviewAndSharedJumpPath(t *testing.T) {
@@ -308,12 +342,9 @@ func containsArgPair(args []string, key, value string) bool {
 	return false
 }
 
-func executeInboxCommand(command interface {
-	SetOut(io.Writer)
-	SetErr(io.Writer)
-	SetArgs([]string)
-	Execute() error
-}, args ...string) (string, error) {
+func executeInboxCommand(command *cobra.Command, args ...string) (string, error) {
+	command.SilenceErrors = true
+	command.SilenceUsage = true
 	var output bytes.Buffer
 	command.SetOut(&output)
 	command.SetErr(&output)
