@@ -98,6 +98,36 @@ func SwitchClient(target string) error {
 	return err
 }
 
+func SwitchClientFor(client, target string) error {
+	_, err := run("switch-client", "-c", client, "-t", "="+target)
+	return err
+}
+
+func SelectWindow(target string) error {
+	_, err := run("select-window", "-t", target)
+	return err
+}
+
+func SelectPane(target string) error {
+	_, err := run("select-pane", "-t", target)
+	return err
+}
+
+func PaneWindowZoomed(target string) (bool, error) {
+	out, err := run("display-message", "-t", target, "-p", "#{window_zoomed_flag}")
+	return out == "1", err
+}
+
+func TogglePaneZoom(target string) error {
+	_, err := run("resize-pane", "-Z", "-t", target)
+	return err
+}
+
+func DisplayMessage(client, message string) error {
+	_, err := run("display-message", "-c", client, message)
+	return err
+}
+
 func Attach(target string) error {
 	cmd := exec.Command("tmux", "attach-session", "-t", "="+target)
 	cmd.Stdin = os.Stdin

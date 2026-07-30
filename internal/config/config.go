@@ -48,6 +48,7 @@ type WatchConfig struct {
 	CaptureLines int      `yaml:"capture_lines"`
 	Agents       []string `yaml:"agents"`
 	ReapTTL      Duration `yaml:"reap_ttl"`
+	FocusCommand string   `yaml:"focus_command,omitempty"`
 }
 
 type JumpAction string
@@ -235,6 +236,8 @@ watch:
   capture_lines: 30
   agents: [claude, codex]
   reap_ttl: 24h
+  # Used by profiles with jump_action: focus. {pane} becomes the target pane id.
+  # focus_command: '~/.tmux/focus-inplace.sh focus "{pane}"'
 `
 
 func createDefault(path string) (*Config, error) {
