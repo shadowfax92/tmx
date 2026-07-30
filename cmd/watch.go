@@ -100,9 +100,10 @@ func newWatchCommand() *cobra.Command {
 					return err
 				}
 				if !status.Running {
+					fmt.Fprintf(cmd.OutOrStdout(), "watcher stopped\nlog: %s\n", status.LogFile)
 					return errWatcherStopped
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "watcher running (pid %d)\n", status.PID)
+				fmt.Fprintf(cmd.OutOrStdout(), "watcher running (pid %d)\nlog: %s\n", status.PID, status.LogFile)
 				return nil
 			},
 		},

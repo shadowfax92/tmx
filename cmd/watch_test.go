@@ -141,18 +141,19 @@ func TestWatchStatusExitReflectsProcessState(t *testing.T) {
 	t.Cleanup(func() { statusWatchDaemon = original })
 
 	statusWatchDaemon = func() (attn.DaemonStatus, error) {
-		return attn.DaemonStatus{Running: true, PID: 88}, nil
+		return attn.DaemonStatus{Running: true, PID: 88, LogFile: "/state/watch.log"}, nil
 	}
 	output, err := executeWatchCommand("status")
-	if err != nil || output != "watcher running (pid 88)\n" {
+	if err != nil || output != "watcher running (pid 88)\nlog: /state/watch.log\n" {
 		t.Fatalf("running watch status = %q, %v", output, err)
 	}
 
 	statusWatchDaemon = func() (attn.DaemonStatus, error) {
-		return attn.DaemonStatus{}, nil
+		return attn.DaemonStatus{LogFile: "/state/watch.log"}, nil
 	}
 	output, err = executeWatchCommand("status")
-	if !errors.Is(err, errWatcherStopped) || output != "" {
+	if !errors.Is(err, errWatcherStopped) ||
+		output != "watcher stopped\nlog: /state/watch.log\n" {
 		t.Fatalf("stopped watch status = %q, %v", output, err)
 	}
 }

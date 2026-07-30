@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,21 +51,31 @@ func (o WatchOptions) quietThreshold() time.Duration {
 }
 
 var (
-	watchSnapshot  = Snapshot
-	watchDiscover  = DiscoverWithFingerprints
-	watchCapture   = tmux.CapturePane
-	watchFocused   = tmux.FocusedPaneIDs
-	watchSet       = Set
-	watchClear     = Clear
-	watchKillPane  = tmux.KillPane
-	watchReconcile = ReconcileWindowUnreadCounts
+	watchSnapshot      = Snapshot
+	watchDiscover      = DiscoverWithFingerprints
+	watchCapture       = tmux.CapturePane
+	watchFocused       = tmux.FocusedPaneIDs
+	watchSet           = setPaneStateIfCurrent
+	watchClear         = Clear
+	watchKillPane      = tmux.KillPane
+	watchReconcile     = ReconcileWindowUnreadCountsFromSnapshot
+	watchReapReconcile = ReconcileWindowUnreadCounts
 )
 
 // Watcher ties discovery, screen capture, and the pane state machine together.
-// Calls that race pane churn are deliberately best-effort; inventory failures
-// are returned so the foreground loop can exit cleanly when tmux goes away.
+// Per-tick episode details stay here rather than in tmux user options.
 type Watcher struct {
-	options WatchOptions
+	options        WatchOptions
+	panes          map[string]*watchedPane
+	windowActivity map[string]int64
+	ticks          uint64
+	logger         *log.Logger
+}
+
+type watchedPane struct {
+	current   PaneState
+	published PaneState
+	pending   *PaneState
 }
 
 // ReapCandidate is a live attention pane whose screen has not changed past
@@ -107,7 +119,12 @@ func NewWatcher(options WatchOptions) (*Watcher, error) {
 	if err := options.validate(); err != nil {
 		return nil, err
 	}
-	return &Watcher{options: options}, nil
+	return &Watcher{
+		options:        options,
+		panes:          make(map[string]*watchedPane),
+		windowActivity: make(map[string]int64),
+		logger:         log.New(io.Discard, "", 0),
+	}, nil
 }
 
 // FindReapCandidates selects live, non-focused attention panes based only on
@@ -136,7 +153,7 @@ func selectReapCandidates(
 ) ReapSelection {
 	var selection ReapSelection
 	for _, state := range states {
-		if focused[state.ID] || !hasAttentionState(state) {
+		if focused[state.ID] || !hasAttentionState(state) || state.State == StateActive {
 			continue
 		}
 		if state.Changed <= 0 {
@@ -187,18 +204,18 @@ func ReapPanes(candidates []ReapCandidate) (ReapReport, error) {
 		}
 		report.Removed = append(report.Removed, candidate)
 	}
-	if err := watchReconcile(); err != nil {
+	if err := watchReapReconcile(); err != nil {
 		wrapped := fmt.Errorf("reconciling attention counts: %w", err)
 		errs = append(errs, wrapped)
 	}
 	return report, errors.Join(errs...)
 }
 
-// Run polls immediately and then at the configured interval until cancelled
-// or the tmux inventory becomes unavailable.
+// Run polls immediately and then at the configured interval until cancelled.
+// Transient tick errors are logged and retried.
 func (w *Watcher) Run(ctx context.Context) error {
 	if err := w.Tick(time.Now()); err != nil {
-		return nil
+		w.logf("tick error: %v", err)
 	}
 	return w.runAfterInitialTick(ctx)
 }
@@ -213,9 +230,7 @@ func (w *Watcher) runAfterInitialTick(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			if err := w.Tick(time.Now()); err != nil {
-				// A disappearing tmux server is a normal daemon shutdown.
-				// Pane-level churn is already swallowed inside Tick.
-				return nil
+				w.logf("tick error: %v", err)
 			}
 		}
 	}
@@ -225,15 +240,15 @@ func (w *Watcher) runAfterInitialTick(ctx context.Context) error {
 func (w *Watcher) Tick(now time.Time) error {
 	states, err := watchSnapshot()
 	if err != nil {
-		return err
+		return fmt.Errorf("snapshot: %w", err)
 	}
 	discovered, err := watchDiscover(w.options.Agents)
 	if err != nil {
-		return err
+		return fmt.Errorf("discover: %w", err)
 	}
 	focused, err := watchFocused()
 	if err != nil {
-		return err
+		return fmt.Errorf("focused panes: %w", err)
 	}
 
 	byID := make(map[string]PaneState, len(states))
@@ -244,6 +259,7 @@ func (w *Watcher) Tick(now time.Time) error {
 	for _, pane := range discovered {
 		agents[pane.ID] = pane
 	}
+	failedActivityWindows := make(map[string]bool)
 
 	// A live pane whose agent exited is no longer part of attention state.
 	// If the pane vanished entirely, tmux already removed its pane options and
@@ -252,43 +268,275 @@ func (w *Watcher) Tick(now time.Time) error {
 		if _, stillAgent := agents[state.ID]; stillAgent || !hasAttentionState(state) {
 			continue
 		}
-		_ = watchClear(state.ID)
+		if err := watchClear(state.ID); err != nil {
+			w.logf("clear pane=%s error: %v", state.ID, err)
+			continue
+		}
+		if state.State == StateUnread {
+			adjustSnapshotWindowCount(byID, state, -1)
+		}
+		cleared := byID[state.ID]
+		clearPublicState(&cleared)
+		byID[state.ID] = cleared
+		delete(w.panes, state.ID)
+		w.logf("transition pane=%s state=%s->cleared", state.ID, state.State)
 	}
 
 	for _, pane := range discovered {
-		captured, err := watchCapture(pane.ID, w.options.CaptureLines)
-		if err != nil {
-			// The pane may have disappeared between discovery and capture.
-			continue
+		observed := byID[pane.ID]
+		memory, known := w.panes[pane.ID]
+		if !known {
+			memory = &watchedPane{
+				current:   observed,
+				published: publicState(observed),
+			}
+			w.panes[pane.ID] = memory
+		} else if !samePublicState(observed, memory.published) {
+			reconcilePublishedState(&memory.current, memory.published, observed)
+			memory.published = publicState(observed)
+			memory.pending = nil
+			w.logf("external transition pane=%s state=%s watch=%t", pane.ID, observed.State, observed.Watch)
 		}
 
-		state := byID[pane.ID]
-		state.PaneInfo = pane.PaneInfo
-		next, changed := observePane(
-			state,
-			screenHash(captured, w.options.CaptureLines),
+		memory.current.PaneInfo = pane.PaneInfo
+		memory.current.WindowID = observed.WindowID
+		memory.current.WindowActivity = observed.WindowActivity
+		memory.current.WindowUnreadCount = observed.WindowUnreadCount
+
+		hash := memory.current.Hash
+		windowKey := activityWindowKey(observed)
+		previousActivity, sawWindow := w.windowActivity[windowKey]
+		idleWindow := sawWindow && previousActivity == observed.WindowActivity
+		firstCapture := !known || hash == ""
+		if memory.pending != nil {
+			desired := *memory.pending
+			if err := watchSet(pane.ID, memory.published, desired); err != nil {
+				if errors.Is(err, errPaneStateDrift) {
+					w.logf("transition deferred pane=%s: public state changed during tick", pane.ID)
+				} else {
+					w.logf("transition pane=%s error: %v", pane.ID, err)
+				}
+				failedActivityWindows[windowKey] = true
+				continue
+			}
+			w.recordPublishedTransition(byID, pane.ID, observed, memory, desired)
+			memory.pending = nil
+			// This tick was spent committing the pending state, so do not
+			// accept a newer activity timestamp that was not captured.
+			failedActivityWindows[windowKey] = true
+			continue
+		}
+		if firstCapture || !idleWindow {
+			captured, err := watchCapture(pane.ID, w.options.CaptureLines)
+			if err != nil {
+				// The pane may have disappeared between discovery and capture.
+				w.logf("capture pane=%s error: %v", pane.ID, err)
+				failedActivityWindows[windowKey] = true
+				continue
+			}
+			hash = screenHash(captured, w.options.CaptureLines)
+			if !known && observed.WatchSet && !observed.Watch {
+				// Preserve an explicit opt-out across a daemon restart while
+				// still learning the first private screen hash.
+				memory.current.Hash = hash
+				memory.current.Changed = now.Unix()
+				memory.current.Fired = true
+			}
+		}
+
+		previous := memory.current
+		next, _ := observePane(
+			previous,
+			hash,
 			pane.ProcessFingerprint,
 			focused[pane.ID],
 			now,
 			w.options.quietThreshold(),
 		)
-		if changed {
-			// A failing Set is normal if this pane vanished mid-tick.
-			_ = watchSet(pane.ID, next)
+		memory.current = next
+
+		desired := desiredPublicState(next, memory.published)
+		if samePublicState(desired, memory.published) {
+			continue
 		}
+		if err := watchSet(pane.ID, memory.published, desired); err != nil {
+			pending := desired
+			memory.pending = &pending
+			if errors.Is(err, errPaneStateDrift) {
+				w.logf("transition deferred pane=%s: public state changed during tick", pane.ID)
+			} else {
+				w.logf("transition pane=%s error: %v", pane.ID, err)
+			}
+			continue
+		}
+		w.recordPublishedTransition(byID, pane.ID, observed, memory, desired)
 	}
 
-	return watchReconcile()
+	for _, state := range states {
+		windowKey := activityWindowKey(state)
+		if !failedActivityWindows[windowKey] {
+			w.windowActivity[windowKey] = state.WindowActivity
+		}
+	}
+	w.ticks++
+	if w.ticks == 1 || w.ticks%10 == 0 {
+		reconcileStates := make([]PaneState, 0, len(byID))
+		for id, state := range byID {
+			reconcileStates = append(reconcileStates, state)
+			if _, stillAgent := agents[id]; !hasAttentionState(state) && !stillAgent {
+				delete(w.panes, id)
+			}
+		}
+		for id := range w.panes {
+			if _, live := byID[id]; !live {
+				delete(w.panes, id)
+			}
+		}
+		liveWindows := make(map[string]bool)
+		for _, state := range states {
+			liveWindows[activityWindowKey(state)] = true
+		}
+		for window := range w.windowActivity {
+			if !liveWindows[window] {
+				delete(w.windowActivity, window)
+			}
+		}
+		if err := watchReconcile(reconcileStates); err != nil {
+			w.ticks--
+			return fmt.Errorf("reconcile unread counts: %w", err)
+		}
+	}
+	return nil
 }
 
 func hasAttentionState(state PaneState) bool {
 	return state.WatchSet || state.State != "" || state.Since != 0 ||
-		state.Changed != 0 || state.Hash != "" || state.Proc != "" || state.Fired
+		state.Changed != 0 || state.Proc != ""
 }
 
-// observePane is the pure episode state machine. Fired is intentionally
-// persisted separately from the visible state: after read-on-visit the pane
-// returns to quiet, but cannot flag again until its screen changes.
+func publicState(state PaneState) PaneState {
+	return PaneState{
+		Watch:    state.Watch,
+		WatchSet: state.WatchSet,
+		State:    state.State,
+		Since:    state.Since,
+		Changed:  state.Changed,
+		Proc:     state.Proc,
+	}
+}
+
+func desiredPublicState(current, published PaneState) PaneState {
+	desired := publicState(current)
+	desired.WatchSet = true
+
+	// Active-screen timestamps keep moving in memory. Publish the episode
+	// start only when entering active, and publish last-changed only when the
+	// pane settles from active to quiet.
+	if current.State == StateActive {
+		if published.State == StateActive && current.Proc == published.Proc {
+			desired.Since = published.Since
+		}
+		desired.Changed = published.Changed
+	} else if !(current.State == StateQuiet && published.State == StateActive) {
+		desired.Changed = published.Changed
+	}
+	return desired
+}
+
+func reconcilePublishedState(current *PaneState, published, observed PaneState) {
+	externalEpisodeChange := published.Watch != observed.Watch ||
+		published.WatchSet != observed.WatchSet ||
+		published.State != observed.State ||
+		published.Since != observed.Since
+	if published.Watch != observed.Watch || published.WatchSet != observed.WatchSet {
+		current.Watch = observed.Watch
+		current.WatchSet = observed.WatchSet
+	}
+	if published.State != observed.State {
+		current.State = observed.State
+	}
+	if published.Since != observed.Since {
+		current.Since = observed.Since
+	}
+	if published.Changed != observed.Changed {
+		current.Changed = observed.Changed
+	}
+	if published.Proc != observed.Proc {
+		current.Proc = observed.Proc
+	}
+	if externalEpisodeChange {
+		current.Fired = observed.State != StateActive
+	}
+}
+
+func updateSnapshotPublicState(states map[string]PaneState, paneID string, public PaneState) {
+	state := states[paneID]
+	state.Watch = public.Watch
+	state.WatchSet = public.WatchSet
+	state.State = public.State
+	state.Since = public.Since
+	state.Changed = public.Changed
+	state.Proc = public.Proc
+	states[paneID] = state
+}
+
+func clearPublicState(state *PaneState) {
+	state.Watch = false
+	state.WatchSet = false
+	state.State = ""
+	state.Since = 0
+	state.Changed = 0
+	state.Proc = ""
+}
+
+func adjustSnapshotWindowCount(states map[string]PaneState, pane PaneState, delta int) {
+	target := windowTarget(pane)
+	for id, state := range states {
+		if windowTarget(state) != target {
+			continue
+		}
+		state.WindowUnreadCount += delta
+		if state.WindowUnreadCount < 0 {
+			state.WindowUnreadCount = 0
+		}
+		states[id] = state
+	}
+}
+
+func activityWindowKey(state PaneState) string {
+	if state.WindowID != "" {
+		return state.WindowID
+	}
+	return windowTarget(state)
+}
+
+func (w *Watcher) logf(format string, args ...any) {
+	w.logger.Printf(format, args...)
+}
+
+func (w *Watcher) recordPublishedTransition(
+	states map[string]PaneState,
+	paneID string,
+	observed PaneState,
+	memory *watchedPane,
+	desired PaneState,
+) {
+	if memory.published.State != StateUnread && desired.State == StateUnread {
+		adjustSnapshotWindowCount(states, observed, 1)
+	} else if memory.published.State == StateUnread && desired.State != StateUnread {
+		adjustSnapshotWindowCount(states, observed, -1)
+	}
+	updateSnapshotPublicState(states, paneID, desired)
+	w.logf(
+		"transition pane=%s state=%s->%s watch=%t proc=%q",
+		paneID, memory.published.State, desired.State, desired.Watch, desired.Proc,
+	)
+	memory.published = desired
+}
+
+// observePane is the pure episode state machine. Fired is daemon-private:
+// after read-on-visit the pane returns to quiet, but cannot flag again until
+// its screen changes.
 func observePane(
 	state PaneState,
 	hash string,
@@ -482,6 +730,7 @@ func encodeStateComponent(value string) string {
 type DaemonStatus struct {
 	Running bool
 	PID     int
+	LogFile string
 }
 
 type daemonBackend interface {
@@ -660,7 +909,7 @@ func (m *DaemonManager) Status() (DaemonStatus, error) {
 func (m *DaemonManager) statusUnlocked(removeStale bool) (DaemonStatus, error) {
 	pidFile, err := os.OpenFile(m.Paths.PIDFile, os.O_RDWR, 0600)
 	if errors.Is(err, os.ErrNotExist) {
-		return DaemonStatus{}, nil
+		return DaemonStatus{LogFile: m.Paths.LogFile}, nil
 	}
 	if err != nil {
 		return DaemonStatus{}, err
@@ -673,7 +922,7 @@ func (m *DaemonManager) statusUnlocked(removeStale bool) (DaemonStatus, error) {
 			_ = os.Remove(m.Paths.PIDFile)
 		}
 		_ = syscall.Flock(int(pidFile.Fd()), syscall.LOCK_UN)
-		return DaemonStatus{}, nil
+		return DaemonStatus{LogFile: m.Paths.LogFile}, nil
 	}
 	if !lockWouldBlock(err) {
 		return DaemonStatus{}, err
@@ -683,9 +932,9 @@ func (m *DaemonManager) statusUnlocked(removeStale bool) (DaemonStatus, error) {
 	if err != nil {
 		// A watcher holds the file lock but has not marked its first tick
 		// ready yet.
-		return DaemonStatus{}, nil
+		return DaemonStatus{LogFile: m.Paths.LogFile}, nil
 	}
-	return DaemonStatus{Running: true, PID: pid}, nil
+	return DaemonStatus{Running: true, PID: pid, LogFile: m.Paths.LogFile}, nil
 }
 
 // Stop asks a live watcher to terminate and waits briefly for its pidfile to
@@ -735,7 +984,7 @@ func (m *DaemonManager) Stop() (DaemonStatus, bool, error) {
 // RunForeground holds the pidfile lock for the process lifetime. It writes the
 // PID only after the first successful inventory tick, which is the detached
 // start command's readiness handshake.
-func (m *DaemonManager) RunForeground(ctx context.Context, options WatchOptions) error {
+func (m *DaemonManager) RunForeground(ctx context.Context, options WatchOptions) (runErr error) {
 	m.ensureDefaults()
 	if err := m.ensureDir(); err != nil {
 		return err
@@ -745,16 +994,46 @@ func (m *DaemonManager) RunForeground(ctx context.Context, options WatchOptions)
 		return err
 	}
 
+	logFile, err := os.OpenFile(m.Paths.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = logFile.Close() }()
+	watcher.logger = log.New(logFile, "", log.LstdFlags|log.Lmicroseconds)
+
 	guard, err := acquirePIDGuard(m.Paths.PIDFile, m.backend.CurrentPID(), m.startTimeout, m.pollInterval)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = guard.Close() }()
+	pid := m.backend.CurrentPID()
+	watcher.logf("watcher starting pid=%d", pid)
+	defer func() {
+		if runErr != nil {
+			watcher.logf("watcher stopped pid=%d error=%v", pid, runErr)
+		} else {
+			watcher.logf("watcher stopped pid=%d", pid)
+		}
+	}()
 
-	if err := watcher.Tick(time.Now()); err != nil {
-		// No server (or a server shutting down) is a normal foreground exit,
-		// but the pidfile never becomes ready.
-		return nil
+	for {
+		if err := watcher.Tick(time.Now()); err == nil {
+			break
+		} else {
+			watcher.logf("initial tick error: %v", err)
+		}
+		timer := time.NewTimer(options.Poll)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil
+		case <-timer.C:
+		}
 	}
 	if err := guard.MarkReady(); err != nil {
 		return err

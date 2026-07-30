@@ -62,6 +62,32 @@ func run(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// RunCommands executes several tmux commands in one client process. tmux
+// treats a standalone semicolon argument as a command separator; no shell is
+// involved.
+func RunCommands(commands ...[]string) error {
+	args := commandBatchArgs(commands...)
+	if len(args) == 0 {
+		return nil
+	}
+	_, err := run(args...)
+	return err
+}
+
+func commandBatchArgs(commands ...[]string) []string {
+	var args []string
+	for _, command := range commands {
+		if len(command) == 0 {
+			continue
+		}
+		if len(args) > 0 {
+			args = append(args, ";")
+		}
+		args = append(args, command...)
+	}
+	return args
+}
+
 func IsInsideTmux() bool {
 	return os.Getenv("TMUX") != ""
 }
@@ -290,8 +316,15 @@ func AdjustWindowVar(target, key string, delta int) error {
 	if delta == 0 {
 		return nil
 	}
-	_, err := run("set-option", "-w", "-F", "-t", target, "@"+key, windowAdjustmentFormat(key, delta))
+	_, err := run(WindowAdjustmentArgs(target, key, delta)...)
 	return err
+}
+
+func WindowAdjustmentArgs(target, key string, delta int) []string {
+	return []string{
+		"set-option", "-w", "-F", "-t", target,
+		"@" + key, windowAdjustmentFormat(key, delta),
+	}
 }
 
 func windowAdjustmentFormat(key string, delta int) string {
@@ -320,11 +353,10 @@ func ListPanesFormat(format string) (string, error) {
 	return run("list-panes", "-a", "-F", format)
 }
 
-// CapturePane returns target's visible contents plus historyLines of scrollback
-// with escape sequences preserved. Attention callers strip ANSI and retain
-// only their configured tail before hashing.
+// CapturePane returns target's visible contents plus historyLines of
+// scrollback. Wrapped lines are joined so hashing is stable across captures.
 func CapturePane(target string, historyLines int) (string, error) {
-	args := []string{"capture-pane", "-p", "-e", "-J", "-t", target}
+	args := []string{"capture-pane", "-p", "-J", "-t", target}
 	if historyLines > 0 {
 		args = append(args, "-S", fmt.Sprintf("-%d", historyLines))
 	}

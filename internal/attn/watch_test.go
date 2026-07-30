@@ -1,10 +1,14 @@
 package attn
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -179,6 +183,11 @@ func TestSelectReapCandidatesUsesLastScreenChangeIncludesUnwatchedAndProtectsFoc
 		state("%unwatched", "work:2.0", false, now.Add(-25*time.Hour)),
 		state("%fresh", "work:3.0", true, now.Add(-time.Hour)),
 		state("%focused", "work:4.0", true, now.Add(-72*time.Hour)),
+		{
+			PaneInfo: tmux.PaneInfo{ID: "%active", Target: "work:5.0"},
+			Watch:    true, WatchSet: true, State: StateActive,
+			Changed: now.Add(-96 * time.Hour).Unix(),
+		},
 		{PaneInfo: tmux.PaneInfo{ID: "%missing"}, Watch: true, WatchSet: true, State: StateQuiet},
 		{PaneInfo: tmux.PaneInfo{ID: "%ordinary"}},
 	}
@@ -197,12 +206,533 @@ func TestSelectReapCandidatesUsesLastScreenChangeIncludesUnwatchedAndProtectsFoc
 	}
 }
 
+func TestWatcherKeepsStreamingStatePrivateAndSkipsIdleWindowCaptures(t *testing.T) {
+	options := WatchOptions{
+		Poll: time.Second, GracePeriods: 2, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	}
+	watcher, err := NewWatcher(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	watcher.logger = logForTest(&logs)
+
+	rollCall := PaneState{
+		PaneInfo:       tmux.PaneInfo{ID: "%1", Target: "work:1.0", Session: "work", WindowIndex: 1},
+		WindowID:       "@1",
+		WindowActivity: 100,
+	}
+	process := "101:claude"
+	captures, snapshots, reconciles := 0, 0, 0
+	var writes []PaneState
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) {
+			snapshots++
+			return []PaneState{rollCall}, nil
+		},
+		discover: func([]string) ([]DiscoveredPane, error) {
+			return []DiscoveredPane{{
+				PaneInfo: rollCall.PaneInfo, ProcessFingerprint: process,
+			}}, nil
+		},
+		focused: func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture: func(string, int) (string, error) {
+			captures++
+			return "screen-" + strconv.Itoa(captures), nil
+		},
+		set: func(_ string, expected, next PaneState) error {
+			if !samePublicState(expected, rollCall) {
+				t.Fatalf("transition expected %#v, roll call %#v", expected, publicState(rollCall))
+			}
+			writes = append(writes, next)
+			applyPublicForTest(&rollCall, next)
+			return nil
+		},
+		clear: func(string) error { return nil },
+		reconcile: func([]PaneState) error {
+			reconciles++
+			return nil
+		},
+	})
+
+	if err := watcher.Tick(unixTime(100)); err != nil {
+		t.Fatal(err)
+	}
+	rollCall.WindowActivity = 101
+	if err := watcher.Tick(unixTime(101)); err != nil {
+		t.Fatal(err)
+	}
+	rollCall.WindowActivity = 102
+	if err := watcher.Tick(unixTime(102)); err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 1 || writes[0].State != StateActive {
+		t.Fatalf("streaming writes = %#v, want only initial active transition", writes)
+	}
+
+	// Activity is unchanged, so these ticks reuse the private hash. The first
+	// settles active -> quiet and publishes the frozen last-change timestamp;
+	// the second reaches the quiet threshold and flags unread.
+	if err := watcher.Tick(unixTime(103)); err != nil {
+		t.Fatal(err)
+	}
+	if err := watcher.Tick(unixTime(104)); err != nil {
+		t.Fatal(err)
+	}
+
+	if captures != 3 {
+		t.Fatalf("capture calls = %d, want 3 (idle ticks skipped)", captures)
+	}
+	if len(writes) != 3 || writes[1].State != StateQuiet || writes[1].Changed != 102 ||
+		writes[2].State != StateUnread {
+		t.Fatalf("transition writes = %#v, want active, quiet(changed=102), unread", writes)
+	}
+	if rollCall.Hash != "" || rollCall.Fired {
+		t.Fatalf("roll call contains daemon-private fields: %#v", rollCall)
+	}
+	if memory := watcher.panes["%1"].current; memory.Hash == "" || !memory.Fired {
+		t.Fatalf("watcher private state = %#v, want learned hash and fired episode", memory)
+	}
+	if snapshots != 5 || reconciles != 1 {
+		t.Fatalf("snapshots=%d reconciles=%d, want one roll call/tick and no second reconcile snapshot", snapshots, reconciles)
+	}
+	if !strings.Contains(logs.String(), "state=active->quiet") {
+		t.Fatalf("transition log = %q, want state transition", logs.String())
+	}
+}
+
+func TestWatcherReconcilesCLIChangesAndRearmsUnwatchOnProcessChange(t *testing.T) {
+	watcher, err := NewWatcher(WatchOptions{
+		Poll: time.Second, GracePeriods: 30, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude", "codex"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rollCall := PaneState{
+		PaneInfo:       tmux.PaneInfo{ID: "%1", Target: "work:1.0", Session: "work", WindowIndex: 1},
+		WindowID:       "@1",
+		WindowActivity: 100,
+	}
+	process := "101:claude"
+	captures := 0
+	var writes []PaneState
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) { return []PaneState{rollCall}, nil },
+		discover: func([]string) ([]DiscoveredPane, error) {
+			return []DiscoveredPane{{
+				PaneInfo: rollCall.PaneInfo, ProcessFingerprint: process,
+			}}, nil
+		},
+		focused: func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture: func(string, int) (string, error) {
+			captures++
+			return "same screen", nil
+		},
+		set: func(_ string, expected, next PaneState) error {
+			if !samePublicState(expected, rollCall) {
+				t.Fatalf("transition expected %#v, roll call %#v", expected, publicState(rollCall))
+			}
+			writes = append(writes, next)
+			applyPublicForTest(&rollCall, next)
+			return nil
+		},
+		clear:     func(string) error { return nil },
+		reconcile: func([]PaneState) error { return nil },
+	})
+
+	if err := watcher.Tick(unixTime(100)); err != nil {
+		t.Fatal(err)
+	}
+	if err := watcher.Tick(unixTime(101)); err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 2 || rollCall.State != StateQuiet {
+		t.Fatalf("initial transitions = %#v roll call=%#v", writes, rollCall)
+	}
+
+	// These are the public mutations performed by unwatch, mark unread,
+	// snooze, and mark read in separate CLI processes. Each must be accepted
+	// by the daemon without a compensating write.
+	rollCall.Watch = false
+	rollCall.State = StateQuiet
+	rollCall.Since = 110
+	if err := watcher.Tick(unixTime(110)); err != nil {
+		t.Fatal(err)
+	}
+	rollCall.Watch = true
+	rollCall.State = StateUnread
+	rollCall.Since = 111
+	if err := watcher.Tick(unixTime(111)); err != nil {
+		t.Fatal(err)
+	}
+	rollCall.Since = 112 // snooze
+	if err := watcher.Tick(unixTime(112)); err != nil {
+		t.Fatal(err)
+	}
+	rollCall.State = StateQuiet // mark read
+	rollCall.Since = 113
+	if err := watcher.Tick(unixTime(113)); err != nil {
+		t.Fatal(err)
+	}
+	rollCall.Watch = false // unwatch again
+	rollCall.Since = 114
+	if err := watcher.Tick(unixTime(114)); err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 2 {
+		t.Fatalf("daemon fought CLI mutations with writes: %#v", writes[2:])
+	}
+
+	process = "202:codex"
+	if err := watcher.Tick(unixTime(115)); err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 3 || !rollCall.Watch || rollCall.State != StateActive ||
+		rollCall.Proc != process {
+		t.Fatalf("process re-arm writes=%#v roll call=%#v", writes, rollCall)
+	}
+	if captures != 1 {
+		t.Fatalf("capture calls = %d, want first sight only for idle window", captures)
+	}
+
+	if err := watcher.Tick(unixTime(116)); err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 4 || rollCall.State != StateQuiet || rollCall.Changed != 115 {
+		t.Fatalf("settled process episode writes=%#v roll call=%#v", writes, rollCall)
+	}
+	selection := selectReapCandidates(
+		[]PaneState{rollCall}, map[string]bool{}, time.Second, unixTime(118),
+	)
+	if len(selection.Candidates) != 1 || selection.Candidates[0].ID != "%1" {
+		t.Fatalf("reap selection after quiet transition = %#v", selection)
+	}
+}
+
+func TestWatcherRetriesFailedTransitionWithoutAnotherPrivateChange(t *testing.T) {
+	watcher, err := NewWatcher(WatchOptions{
+		Poll: time.Second, GracePeriods: 30, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollCall := PaneState{
+		PaneInfo:       tmux.PaneInfo{ID: "%1", Target: "work:1.0"},
+		WindowID:       "@1",
+		WindowActivity: 100,
+	}
+	attempts := 0
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) { return []PaneState{rollCall}, nil },
+		discover: func([]string) ([]DiscoveredPane, error) {
+			return []DiscoveredPane{{
+				PaneInfo: rollCall.PaneInfo, ProcessFingerprint: "101:claude",
+			}}, nil
+		},
+		focused: func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture: func(string, int) (string, error) { return "same", nil },
+		set: func(_ string, _ PaneState, next PaneState) error {
+			attempts++
+			if attempts == 2 {
+				return errors.New("temporary set failure")
+			}
+			applyPublicForTest(&rollCall, next)
+			return nil
+		},
+		clear:     func(string) error { return nil },
+		reconcile: func([]PaneState) error { return nil },
+	})
+
+	if err := watcher.Tick(unixTime(100)); err != nil {
+		t.Fatal(err)
+	}
+	if err := watcher.Tick(unixTime(101)); err != nil {
+		t.Fatal(err)
+	}
+	if rollCall.State != StateActive {
+		t.Fatalf("failed transition changed roll call to %s", rollCall.State)
+	}
+	if err := watcher.Tick(unixTime(102)); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 || rollCall.State != StateQuiet {
+		t.Fatalf("transition attempts=%d roll call=%#v, want retry to quiet", attempts, rollCall)
+	}
+}
+
+func TestWatcherCommitsFailedInitialActiveBeforeSettlingQuiet(t *testing.T) {
+	watcher, err := NewWatcher(WatchOptions{
+		Poll: time.Second, GracePeriods: 30, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollCall := PaneState{
+		PaneInfo:       tmux.PaneInfo{ID: "%1", Target: "work:1.0"},
+		WindowID:       "@1",
+		WindowActivity: 100,
+	}
+	attempts, captures := 0, 0
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) { return []PaneState{rollCall}, nil },
+		discover: func([]string) ([]DiscoveredPane, error) {
+			return []DiscoveredPane{{
+				PaneInfo: rollCall.PaneInfo, ProcessFingerprint: "101:claude",
+			}}, nil
+		},
+		focused: func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture: func(string, int) (string, error) {
+			captures++
+			return "same", nil
+		},
+		set: func(_ string, _ PaneState, next PaneState) error {
+			attempts++
+			if attempts == 1 {
+				return errors.New("temporary initial write failure")
+			}
+			applyPublicForTest(&rollCall, next)
+			return nil
+		},
+		clear:     func(string) error { return nil },
+		reconcile: func([]PaneState) error { return nil },
+	})
+
+	if err := watcher.Tick(unixTime(100)); err != nil {
+		t.Fatal(err)
+	}
+	if err := watcher.Tick(unixTime(101)); err != nil {
+		t.Fatal(err)
+	}
+	if rollCall.State != StateActive || rollCall.Changed != 0 {
+		t.Fatalf("retried initial transition = %#v, want active with no reap timestamp", rollCall)
+	}
+	if err := watcher.Tick(unixTime(102)); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 || captures != 1 ||
+		rollCall.State != StateQuiet || rollCall.Changed != 100 {
+		t.Fatalf("attempts=%d captures=%d roll call=%#v, want quiet with frozen change timestamp",
+			attempts, captures, rollCall)
+	}
+}
+
+func TestWatcherRetriesCaptureWhenWindowActivityCouldNotBeObserved(t *testing.T) {
+	watcher, err := NewWatcher(WatchOptions{
+		Poll: time.Second, GracePeriods: 30, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rollCall := PaneState{
+		PaneInfo:       tmux.PaneInfo{ID: "%1", Target: "work:1.0"},
+		WindowID:       "@1",
+		WindowActivity: 100,
+	}
+	captures := 0
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) { return []PaneState{rollCall}, nil },
+		discover: func([]string) ([]DiscoveredPane, error) {
+			return []DiscoveredPane{{
+				PaneInfo: rollCall.PaneInfo, ProcessFingerprint: "101:claude",
+			}}, nil
+		},
+		focused: func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture: func(string, int) (string, error) {
+			captures++
+			if captures == 2 {
+				return "", errors.New("temporary capture failure")
+			}
+			return "screen-" + strconv.Itoa(captures), nil
+		},
+		set: func(_ string, _ PaneState, next PaneState) error {
+			applyPublicForTest(&rollCall, next)
+			return nil
+		},
+		clear:     func(string) error { return nil },
+		reconcile: func([]PaneState) error { return nil },
+	})
+
+	if err := watcher.Tick(unixTime(100)); err != nil {
+		t.Fatal(err)
+	}
+	rollCall.WindowActivity = 101
+	if err := watcher.Tick(unixTime(101)); err != nil {
+		t.Fatal(err)
+	}
+	if err := watcher.Tick(unixTime(102)); err != nil {
+		t.Fatal(err)
+	}
+	if captures != 3 {
+		t.Fatalf("capture calls = %d, want failed activity capture retried next tick", captures)
+	}
+}
+
+func TestWatcherRunLogsAndRetriesTransientTickErrors(t *testing.T) {
+	watcher, err := NewWatcher(WatchOptions{
+		Poll: time.Millisecond, GracePeriods: 1, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	watcher.logger = logForTest(&logs)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	snapshotCalls := 0
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) {
+			snapshotCalls++
+			if snapshotCalls < 3 {
+				return nil, errors.New("temporary tmux failure")
+			}
+			cancel()
+			return nil, nil
+		},
+		discover:  func([]string) ([]DiscoveredPane, error) { return nil, nil },
+		focused:   func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture:   func(string, int) (string, error) { return "", nil },
+		set:       func(string, PaneState, PaneState) error { return nil },
+		clear:     func(string) error { return nil },
+		reconcile: func([]PaneState) error { return nil },
+	})
+
+	if err := watcher.Run(ctx); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if snapshotCalls != 3 {
+		t.Fatalf("snapshot calls = %d, want retry through success", snapshotCalls)
+	}
+	if got := logs.String(); strings.Count(got, "tick error: snapshot: temporary tmux failure") != 2 {
+		t.Fatalf("retry log = %q", got)
+	}
+}
+
+func TestWatcherRetriesFailedFullReconcileOnNextTick(t *testing.T) {
+	watcher, err := NewWatcher(WatchOptions{
+		Poll: time.Second, GracePeriods: 1, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciles := 0
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) { return nil, nil },
+		discover: func([]string) ([]DiscoveredPane, error) { return nil, nil },
+		focused:  func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture:  func(string, int) (string, error) { return "", nil },
+		set:      func(string, PaneState, PaneState) error { return nil },
+		clear:    func(string) error { return nil },
+		reconcile: func([]PaneState) error {
+			reconciles++
+			if reconciles == 1 {
+				return errors.New("temporary reconcile failure")
+			}
+			return nil
+		},
+	})
+
+	if err := watcher.Tick(unixTime(100)); err == nil {
+		t.Fatal("first Tick() succeeded, want reconcile error")
+	}
+	if err := watcher.Tick(unixTime(101)); err != nil {
+		t.Fatalf("second Tick() error = %v", err)
+	}
+	if reconciles != 2 {
+		t.Fatalf("reconcile calls = %d, want immediate retry", reconciles)
+	}
+}
+
+func TestWatcherFullReconcileDropsVanishedPrivateState(t *testing.T) {
+	watcher, err := NewWatcher(WatchOptions{
+		Poll: time.Second, GracePeriods: 1, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	watcher.ticks = 9
+	watcher.panes["%gone"] = &watchedPane{
+		current: PaneState{PaneInfo: tmux.PaneInfo{ID: "%gone"}, Hash: "private"},
+	}
+	watcher.windowActivity["@gone"] = 42
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) { return nil, nil },
+		discover: func([]string) ([]DiscoveredPane, error) { return nil, nil },
+		focused:  func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture:  func(string, int) (string, error) { return "", nil },
+		set:      func(string, PaneState, PaneState) error { return nil },
+		clear:    func(string) error { return nil },
+		reconcile: func(states []PaneState) error {
+			if len(states) != 0 {
+				t.Fatalf("reconcile states = %#v, want empty roll call", states)
+			}
+			return nil
+		},
+	})
+
+	if err := watcher.Tick(unixTime(100)); err != nil {
+		t.Fatal(err)
+	}
+	if len(watcher.panes) != 0 || len(watcher.windowActivity) != 0 {
+		t.Fatalf("private drift after reconcile: panes=%#v windows=%#v",
+			watcher.panes, watcher.windowActivity)
+	}
+}
+
+func TestDaemonForegroundLogsLifecycleWithPID(t *testing.T) {
+	dir := t.TempDir()
+	manager := &DaemonManager{
+		Paths: DaemonPaths{
+			Dir: dir, PIDFile: filepath.Join(dir, "watch.pid"), LogFile: filepath.Join(dir, "watch.log"),
+		},
+		backend:      &fakeDaemonBackend{currentPID: 77, alive: make(map[int]bool)},
+		startTimeout: time.Second,
+		pollInterval: time.Millisecond,
+	}
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot:  func() ([]PaneState, error) { return nil, nil },
+		discover:  func([]string) ([]DiscoveredPane, error) { return nil, nil },
+		focused:   func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture:   func(string, int) (string, error) { return "", nil },
+		set:       func(string, PaneState, PaneState) error { return nil },
+		clear:     func(string) error { return nil },
+		reconcile: func([]PaneState) error { return nil },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := manager.RunForeground(ctx, WatchOptions{
+		Poll: time.Second, GracePeriods: 1, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	})
+	if err != nil {
+		t.Fatalf("RunForeground() error = %v", err)
+	}
+	logData, err := os.ReadFile(manager.Paths.LogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logged := string(logData)
+	if !strings.Contains(logged, "watcher starting pid=77") ||
+		!strings.Contains(logged, "watcher stopped pid=77") {
+		t.Fatalf("lifecycle log = %q", logged)
+	}
+}
+
 func TestReapPanesRechecksFocusKillsUnfocusedPanesAndReconcilesAggregates(t *testing.T) {
 	originalFocused, originalKill := watchFocused, watchKillPane
-	originalReconcile := watchReconcile
+	originalReconcile := watchReapReconcile
 	t.Cleanup(func() {
 		watchFocused, watchKillPane = originalFocused, originalKill
-		watchReconcile = originalReconcile
+		watchReapReconcile = originalReconcile
 	})
 
 	var killed []string
@@ -212,7 +742,7 @@ func TestReapPanesRechecksFocusKillsUnfocusedPanesAndReconcilesAggregates(t *tes
 		killed = append(killed, target)
 		return nil
 	}
-	watchReconcile = func() error {
+	watchReapReconcile = func() error {
 		reconciled++
 		return nil
 	}
@@ -237,10 +767,10 @@ func TestReapPanesRechecksFocusKillsUnfocusedPanesAndReconcilesAggregates(t *tes
 
 func TestReapPanesKillFailureDoesNotStopRemainingKills(t *testing.T) {
 	originalFocused, originalKill := watchFocused, watchKillPane
-	originalReconcile := watchReconcile
+	originalReconcile := watchReapReconcile
 	t.Cleanup(func() {
 		watchFocused, watchKillPane = originalFocused, originalKill
-		watchReconcile = originalReconcile
+		watchReapReconcile = originalReconcile
 	})
 
 	var killed []string
@@ -253,7 +783,7 @@ func TestReapPanesKillFailureDoesNotStopRemainingKills(t *testing.T) {
 		}
 		return nil
 	}
-	watchReconcile = func() error {
+	watchReapReconcile = func() error {
 		reconciled++
 		return nil
 	}
@@ -319,7 +849,7 @@ func TestWatcherTickClearsExitedAgentsReadsFocusedPaneAndInitializesNewPane(t *t
 			}
 			return "new screen", nil
 		},
-		set: func(target string, state PaneState) error {
+		set: func(target string, _ PaneState, state PaneState) error {
 			written[target] = state
 			return nil
 		},
@@ -327,7 +857,7 @@ func TestWatcherTickClearsExitedAgentsReadsFocusedPaneAndInitializesNewPane(t *t
 			cleared = append(cleared, target)
 			return nil
 		},
-		reconcile: func() error {
+		reconcile: func([]PaneState) error {
 			reconciled++
 			return nil
 		},
@@ -339,10 +869,11 @@ func TestWatcherTickClearsExitedAgentsReadsFocusedPaneAndInitializesNewPane(t *t
 	if !slices.Equal(cleared, []string{"%old"}) {
 		t.Fatalf("cleared panes = %#v, want %%old", cleared)
 	}
-	if got := written["%focus"]; got.State != StateQuiet || !got.Fired {
-		t.Fatalf("focused pane state = %#v, want fired quiet", got)
+	if got := written["%focus"]; got.State != StateQuiet {
+		t.Fatalf("focused pane state = %#v, want quiet", got)
 	}
-	if got := written["%new"]; got.State != StateActive || !got.Watch || got.Hash == "" {
+	if got := written["%new"]; got.State != StateActive || !got.Watch ||
+		got.Hash != "" || got.Fired {
 		t.Fatalf("new pane state = %#v, want watched active", got)
 	}
 	if reconciled != 1 {
@@ -369,9 +900,9 @@ func TestWatcherTickSkipsPaneThatVanishesDuringCapture(t *testing.T) {
 		},
 		focused:   func() (map[string]bool, error) { return map[string]bool{}, nil },
 		capture:   func(string, int) (string, error) { return "", errors.New("pane vanished") },
-		set:       func(string, PaneState) error { setCalls++; return nil },
+		set:       func(string, PaneState, PaneState) error { setCalls++; return nil },
 		clear:     func(string) error { return nil },
-		reconcile: func() error { return nil },
+		reconcile: func([]PaneState) error { return nil },
 	})
 
 	if err := watcher.Tick(time.Now()); err != nil {
@@ -566,6 +1097,19 @@ func unixTime(seconds int64) time.Time {
 	return time.Unix(seconds, 0)
 }
 
+func logForTest(output *bytes.Buffer) *log.Logger {
+	return log.New(output, "", 0)
+}
+
+func applyPublicForTest(state *PaneState, public PaneState) {
+	state.Watch = public.Watch
+	state.WatchSet = public.WatchSet
+	state.State = public.State
+	state.Since = public.Since
+	state.Changed = public.Changed
+	state.Proc = public.Proc
+}
+
 func assertWatchState(
 	t *testing.T,
 	state PaneState,
@@ -586,9 +1130,9 @@ type watchBoundaryStub struct {
 	discover  func([]string) ([]DiscoveredPane, error)
 	capture   func(string, int) (string, error)
 	focused   func() (map[string]bool, error)
-	set       func(string, PaneState) error
+	set       func(string, PaneState, PaneState) error
 	clear     func(string) error
-	reconcile func() error
+	reconcile func([]PaneState) error
 }
 
 func stubWatchBoundary(t *testing.T, stub watchBoundaryStub) {
