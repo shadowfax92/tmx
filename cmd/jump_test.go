@@ -99,6 +99,49 @@ func TestJumpEmptyInboxDisplaysMessageWithoutFocusChange(t *testing.T) {
 	}
 }
 
+func TestJumpEmptyInboxUsesConfiguredMacNotify(t *testing.T) {
+	backend := newFakeJumpBackend()
+	notified := 0
+	err := runJump(config.JumpActionSelect, "", jumpDeps{
+		backend: backend,
+		snapshot: func() ([]attn.PaneState, error) {
+			return []attn.PaneState{{State: attn.StateQuiet}}, nil
+		},
+		inboxZero: config.NotificationMacNotify,
+		notifyInboxZero: func() error {
+			notified++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("runJump() error = %v", err)
+	}
+	if notified != 1 {
+		t.Fatalf("notifications = %d, want 1", notified)
+	}
+	if len(backend.calls) != 0 {
+		t.Fatalf("backend calls = %#v, want no tmux message", backend.calls)
+	}
+}
+
+func TestJumpEmptyInboxFallsBackToTmuxWhenMacNotifyFails(t *testing.T) {
+	backend := newFakeJumpBackend()
+	err := runJump(config.JumpActionSelect, "", jumpDeps{
+		backend: backend,
+		snapshot: func() ([]attn.PaneState, error) {
+			return nil, nil
+		},
+		inboxZero:       config.NotificationMacNotify,
+		notifyInboxZero: func() error { return errors.New("not installed") },
+	})
+	if err != nil {
+		t.Fatalf("runJump() error = %v", err)
+	}
+	if !slices.Equal(backend.calls, []string{"message client-1 inbox zero"}) {
+		t.Fatalf("calls = %#v, want tmux fallback", backend.calls)
+	}
+}
+
 func TestRepeatedJumpsWalkOldestToNewest(t *testing.T) {
 	states := []attn.PaneState{
 		jumpState("%new", "new", 1, 20),

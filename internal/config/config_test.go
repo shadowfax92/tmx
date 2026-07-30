@@ -69,6 +69,9 @@ func TestResolveSeedsUsableDefaults(t *testing.T) {
 	if c.Watch.ReapTTL.Duration() != DefaultWatchReapTTL {
 		t.Fatalf("default reap TTL = %v, want %v", c.Watch.ReapTTL.Duration(), DefaultWatchReapTTL)
 	}
+	if c.Watch.InboxZero != NotificationTmux {
+		t.Fatalf("default inbox zero backend = %q, want tmux", c.Watch.InboxZero)
+	}
 }
 
 func TestResolvePreservesConfiguredWatchValues(t *testing.T) {
@@ -81,6 +84,7 @@ watch:
   capture_lines: 50
   agents: [aider, codex]
   reap_ttl: 2d
+  inbox_zero: mac-notify
 `), &c)
 	if err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
@@ -92,8 +96,20 @@ watch:
 		c.Watch.Period.Duration() != 45*time.Second ||
 		c.Watch.CaptureLines != 50 ||
 		!slices.Equal(c.Watch.Agents, []string{"aider", "codex"}) ||
-		c.Watch.ReapTTL.Duration() != 48*time.Hour {
+		c.Watch.ReapTTL.Duration() != 48*time.Hour ||
+		c.Watch.InboxZero != NotificationMacNotify {
 		t.Fatalf("resolved watch config = %+v, want configured values", c.Watch)
+	}
+}
+
+func TestNotificationBackendRejectsUnknownValue(t *testing.T) {
+	var c Config
+	err := yaml.Unmarshal([]byte(`
+watch:
+  inbox_zero: growl
+`), &c)
+	if err == nil || !strings.Contains(err.Error(), "invalid notification backend") {
+		t.Fatalf("Unmarshal() error = %v, want invalid notification backend", err)
 	}
 }
 
