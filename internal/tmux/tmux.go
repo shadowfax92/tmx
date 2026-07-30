@@ -360,6 +360,11 @@ func KillWindow(target string) error {
 	return err
 }
 
+func KillPane(target string) error {
+	_, err := run("kill-pane", "-t", target)
+	return err
+}
+
 func RenameCurrentWindow(name string) error {
 	target, err := PaneID()
 	if err != nil {

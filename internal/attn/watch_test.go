@@ -68,6 +68,7 @@ func TestObservePaneConsumesQuietEpisodeWhenAlreadyFocused(t *testing.T) {
 		WatchSet: true,
 		State:    StateQuiet,
 		Since:    100,
+		Changed:  100,
 		Hash:     "screen",
 		Proc:     "claude",
 	}
@@ -85,6 +86,7 @@ func TestObservePaneUnwatchedNeverFlagsAndProcessChangeRearms(t *testing.T) {
 		WatchSet: true,
 		State:    StateActive,
 		Since:    100,
+		Changed:  100,
 		Hash:     "screen-a",
 		Proc:     "claude",
 	}
@@ -114,6 +116,7 @@ func TestObservePaneUnwatchedConsumesExistingUnreadFlag(t *testing.T) {
 		WatchSet: true,
 		State:    StateUnread,
 		Since:    100,
+		Changed:  100,
 		Hash:     "screen",
 		Proc:     "101:claude",
 		Fired:    true,
@@ -123,6 +126,116 @@ func TestObservePaneUnwatchedConsumesExistingUnreadFlag(t *testing.T) {
 	assertWatchState(t, state, changed, StateQuiet, true, true)
 	if state.Watch {
 		t.Fatal("unwatched unread pane was re-armed")
+	}
+}
+
+func TestObservePaneTracksLastScreenChangeSeparatelyFromStateAge(t *testing.T) {
+	quietFor := 90 * time.Second
+	state, _ := observePane(PaneState{}, "screen-a", "claude", false, unixTime(100), quietFor)
+	if state.Changed != 100 {
+		t.Fatalf("initial changed timestamp = %d, want 100", state.Changed)
+	}
+
+	state, _ = observePane(state, "screen-a", "claude", false, unixTime(101), quietFor)
+	state, _ = observePane(state, "screen-a", "claude", false, unixTime(190), quietFor)
+	if state.State != StateUnread || state.Since != 190 || state.Changed != 100 {
+		t.Fatalf("unread state = %#v, want state age 190 and screen change 100", state)
+	}
+
+	state, _ = observePane(state, "screen-a", "claude", true, unixTime(200), quietFor)
+	if state.State != StateQuiet || state.Since != 200 || state.Changed != 100 {
+		t.Fatalf("visited state = %#v, want state age 200 and screen change 100", state)
+	}
+
+	state, _ = observePane(state, "screen-b", "claude", false, unixTime(201), quietFor)
+	if state.State != StateActive || state.Since != 201 || state.Changed != 201 {
+		t.Fatalf("changed screen state = %#v, want both timestamps 201", state)
+	}
+
+	legacy := PaneState{
+		Watch: true, WatchSet: true, State: StateQuiet, Since: 50,
+		Hash: "screen", Proc: "claude",
+	}
+	legacy, changed := observePane(legacy, "screen", "claude", false, unixTime(300), quietFor)
+	if !changed || legacy.Changed != 300 {
+		t.Fatalf("legacy state = %#v changed=%v, want conservative timestamp 300", legacy, changed)
+	}
+}
+
+func TestSelectReapCandidatesUsesLastScreenChangeIncludesUnwatchedAndProtectsFocused(t *testing.T) {
+	now := unixTime(10 * 24 * 60 * 60)
+	ttl := 24 * time.Hour
+	state := func(id, target string, watch bool, changed time.Time) PaneState {
+		return PaneState{
+			PaneInfo: tmux.PaneInfo{ID: id, Target: target},
+			Watch:    watch, WatchSet: true, State: StateQuiet,
+			Since:   now.Unix(),
+			Changed: changed.Unix(),
+			Hash:    "screen",
+		}
+	}
+	states := []PaneState{
+		state("%watched", "work:1.0", true, now.Add(-48*time.Hour)),
+		state("%unwatched", "work:2.0", false, now.Add(-25*time.Hour)),
+		state("%fresh", "work:3.0", true, now.Add(-time.Hour)),
+		state("%focused", "work:4.0", true, now.Add(-72*time.Hour)),
+		{PaneInfo: tmux.PaneInfo{ID: "%missing"}, Watch: true, WatchSet: true, State: StateQuiet},
+		{PaneInfo: tmux.PaneInfo{ID: "%ordinary"}},
+	}
+
+	got := selectReapCandidates(states, map[string]bool{"%focused": true}, ttl, now)
+	if len(got.Candidates) != 2 ||
+		got.Candidates[0].ID != "%watched" ||
+		got.Candidates[1].ID != "%unwatched" {
+		t.Fatalf("candidates = %#v, want watched then explicitly unwatched", got.Candidates)
+	}
+	if got.Candidates[0].Age != 48*time.Hour || got.Candidates[1].Age != 25*time.Hour {
+		t.Fatalf("candidate ages = %v, %v", got.Candidates[0].Age, got.Candidates[1].Age)
+	}
+	if got.MissingTimestamps != 1 {
+		t.Fatalf("missing timestamps = %d, want 1", got.MissingTimestamps)
+	}
+}
+
+func TestReapPanesClearsStateKillsEveryPaneAndReconcilesAggregates(t *testing.T) {
+	originalClear, originalKill := watchClear, watchKillPane
+	originalReconcile := watchReconcile
+	t.Cleanup(func() {
+		watchClear, watchKillPane = originalClear, originalKill
+		watchReconcile = originalReconcile
+	})
+
+	var cleared, killed []string
+	reconciled := 0
+	watchClear = func(target string) error {
+		cleared = append(cleared, target)
+		return nil
+	}
+	watchKillPane = func(target string) error {
+		killed = append(killed, target)
+		return nil
+	}
+	watchReconcile = func() error {
+		reconciled++
+		return nil
+	}
+	candidates := []ReapCandidate{
+		{PaneState: PaneState{PaneInfo: tmux.PaneInfo{ID: "%1"}}},
+		{PaneState: PaneState{PaneInfo: tmux.PaneInfo{ID: "%2"}}},
+	}
+
+	report, err := ReapPanes(candidates)
+	if err != nil {
+		t.Fatalf("ReapPanes() error = %v", err)
+	}
+	if !slices.Equal(cleared, []string{"%1", "%2"}) {
+		t.Fatalf("cleared = %#v, want both panes", cleared)
+	}
+	if !slices.Equal(killed, []string{"%1", "%2"}) {
+		t.Fatalf("killed = %#v, want both panes", killed)
+	}
+	if len(report.Removed) != 2 || len(report.Failed) != 0 || reconciled != 1 {
+		t.Fatalf("report = %#v reconciled=%d, want 2 removed and one reconcile", report, reconciled)
 	}
 }
 
@@ -143,12 +256,12 @@ func TestWatcherTickClearsExitedAgentsReadsFocusedPaneAndInitializesNewPane(t *t
 		{
 			PaneInfo: tmux.PaneInfo{ID: "%old", Command: "zsh"},
 			Watch:    true, WatchSet: true, State: StateUnread, Since: 10,
-			Hash: "old", Proc: "claude", Fired: true,
+			Changed: 5, Hash: "old", Proc: "claude", Fired: true,
 		},
 		{
 			PaneInfo: tmux.PaneInfo{ID: "%focus", Command: "claude"},
 			Watch:    true, WatchSet: true, State: StateUnread, Since: 20,
-			Hash: screenHash("same", options.CaptureLines), Proc: "101:claude", Fired: true,
+			Changed: 15, Hash: screenHash("same", options.CaptureLines), Proc: "101:claude", Fired: true,
 		},
 	}
 	discovered := []DiscoveredPane{
