@@ -3,6 +3,7 @@ package attn
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -32,29 +33,33 @@ const (
 // WatchSet distinguishes a missing @attn_watch from an explicit opt-out.
 type PaneState struct {
 	tmux.PaneInfo
-	Watch    bool
-	WatchSet bool
-	State    AttentionState
-	Since    int64
-	Changed  int64
-	Hash     string
-	Proc     string
-	Fired    bool
+	WindowID          string
+	WindowActivity    int64
+	WindowUnreadCount int
+	Watch             bool
+	WatchSet          bool
+	State             AttentionState
+	Since             int64
+	Changed           int64
+	Hash              string
+	Proc              string
+	Fired             bool
 }
 
-const snapshotFormat = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{@fip_buffer}\t#{pane_current_path}\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_changed}\t#{@attn_hash}\t#{@attn_proc}\t#{@attn_fired}\t_"
+const (
+	snapshotFormat  = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{@fip_buffer}\t#{pane_current_path}\t#{window_id}\t#{window_activity}\t#{@attn_unread_count}\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_changed}\t#{@attn_proc}\t_"
+	paneStateFormat = "_\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_changed}\t#{@attn_proc}\t_"
+)
 
 var (
 	listPanesFormat   = tmux.ListPanesFormat
 	displayPaneFormat = tmux.DisplayPaneFormat
-	showPaneVar       = tmux.ShowPaneVar
-	setPaneVar        = tmux.SetPaneVar
-	unsetPaneVar      = tmux.UnsetPaneVar
-	adjustWindowVar   = tmux.AdjustWindowVar
-	setWindowVar      = tmux.SetWindowVar
+	runCommands       = tmux.RunCommands
 	lockState         = tmux.WaitForLock
 	unlockState       = tmux.WaitForUnlock
 )
+
+var errPaneStateDrift = errors.New("pane attention state changed since snapshot")
 
 // Snapshot returns attention state alongside the existing pane inventory.
 // All attention user options are expanded in one list-panes call.
@@ -73,15 +78,17 @@ func Snapshot() ([]PaneState, error) {
 
 	var states []PaneState
 	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "\t", 19)
-		if len(parts) != 19 {
+		parts := strings.SplitN(line, "\t", 20)
+		if len(parts) != 20 {
 			continue
 		}
 		windowIndex, _ := strconv.Atoi(parts[3])
 		paneIndex, _ := strconv.Atoi(parts[5])
 		pid, _ := strconv.Atoi(parts[6])
-		since, _ := strconv.ParseInt(parts[13], 10, 64)
-		changed, _ := strconv.ParseInt(parts[14], 10, 64)
+		windowActivity, _ := strconv.ParseInt(parts[12], 10, 64)
+		windowUnreadCount, _ := strconv.Atoi(parts[13])
+		since, _ := strconv.ParseInt(parts[16], 10, 64)
+		changed, _ := strconv.ParseInt(parts[17], 10, 64)
 		states = append(states, PaneState{
 			PaneInfo: tmux.PaneInfo{
 				ID:          parts[0],
@@ -96,14 +103,15 @@ func Snapshot() ([]PaneState, error) {
 				FIPBuffer:   parts[9] != "",
 				Path:        parts[10],
 			},
-			Watch:    parts[11] == "1",
-			WatchSet: parts[11] != "",
-			State:    AttentionState(parts[12]),
-			Since:    since,
-			Changed:  changed,
-			Hash:     parts[15],
-			Proc:     parts[16],
-			Fired:    parts[17] == "1",
+			WindowID:          parts[11],
+			WindowActivity:    windowActivity,
+			WindowUnreadCount: windowUnreadCount,
+			Watch:             parts[14] == "1",
+			WatchSet:          parts[14] != "",
+			State:             AttentionState(parts[15]),
+			Since:             since,
+			Changed:           changed,
+			Proc:              parts[18],
 		})
 	}
 	return states, nil
@@ -148,79 +156,93 @@ func Get(target string) (PaneState, error) {
 }
 
 func readPaneState(paneID string) (PaneState, error) {
-	values := make([]string, 7)
-	for i, key := range []string{WatchOption, StateOption, SinceOption, ChangedOption, HashOption, ProcOption, FiredOption} {
-		value, err := showPaneVar(paneID, key)
-		if err != nil {
-			return PaneState{}, err
-		}
-		values[i] = value
+	out, err := displayPaneFormat(paneID, paneStateFormat)
+	if err != nil {
+		return PaneState{}, err
 	}
-	since, _ := strconv.ParseInt(values[2], 10, 64)
-	changed, _ := strconv.ParseInt(values[3], 10, 64)
+	return parsePaneState(out, paneID)
+}
+
+func parsePaneState(out, paneID string) (PaneState, error) {
+	values := strings.SplitN(out, "\t", 7)
+	if len(values) != 7 || values[0] != "_" || values[6] != "_" {
+		return PaneState{}, fmt.Errorf("reading attention state for %s: malformed tmux response", paneID)
+	}
+	since, _ := strconv.ParseInt(values[3], 10, 64)
+	changed, _ := strconv.ParseInt(values[4], 10, 64)
 	return PaneState{
-		Watch:    values[0] == "1",
-		WatchSet: values[0] != "",
-		State:    AttentionState(values[1]),
+		Watch:    values[1] == "1",
+		WatchSet: values[1] != "",
+		State:    AttentionState(values[2]),
 		Since:    since,
 		Changed:  changed,
-		Hash:     values[4],
 		Proc:     values[5],
-		Fired:    values[6] == "1",
 	}, nil
 }
 
 // Set writes the complete pane contract and updates the window unread count
 // when the pane crosses the unread boundary.
 func Set(target string, state PaneState) error {
-	if state.State != StateActive && state.State != StateQuiet && state.State != StateUnread {
-		return fmt.Errorf("invalid attention state %q", state.State)
-	}
 	paneID, err := ResolveTarget(target)
 	if err != nil {
 		return err
 	}
 	return withPaneLock(paneID, func() error {
-		previous, err := showPaneVar(paneID, StateOption)
+		previous, err := readPaneState(paneID)
 		if err != nil {
 			return err
 		}
-
-		watch := "0"
-		if state.Watch {
-			watch = "1"
-		}
-		fired := "0"
-		if state.Fired {
-			fired = "1"
-		}
-		values := []struct {
-			key   string
-			value string
-		}{
-			{WatchOption, watch},
-			{SinceOption, strconv.FormatInt(state.Since, 10)},
-			{ChangedOption, strconv.FormatInt(state.Changed, 10)},
-			{HashOption, state.Hash},
-			{ProcOption, state.Proc},
-			{FiredOption, fired},
-			{StateOption, string(state.State)},
-		}
-		for _, value := range values {
-			if err := setPaneVar(paneID, value.key, value.value); err != nil {
-				return err
-			}
-		}
-
-		switch {
-		case AttentionState(previous) != StateUnread && state.State == StateUnread:
-			return adjustWindowVar(paneID, WindowUnreadCountOption, 1)
-		case AttentionState(previous) == StateUnread && state.State != StateUnread:
-			return adjustWindowVar(paneID, WindowUnreadCountOption, -1)
-		default:
-			return nil
-		}
+		return writePaneState(paneID, previous, state)
 	})
+}
+
+// setPaneStateIfCurrent is the daemon's locked compare-and-set. If a CLI
+// command changed the public contract after the tick snapshot, the daemon
+// leaves it alone and reconciles that drift on the next roll call.
+func setPaneStateIfCurrent(paneID string, expected, state PaneState) error {
+	return withPaneLock(paneID, func() error {
+		current, err := readPaneState(paneID)
+		if err != nil {
+			return err
+		}
+		if !samePublicState(current, expected) {
+			return errPaneStateDrift
+		}
+		return writePaneState(paneID, current, state)
+	})
+}
+
+func writePaneState(paneID string, previous, state PaneState) error {
+	if !validState(state.State) {
+		return fmt.Errorf("invalid attention state %q", state.State)
+	}
+	state.WatchSet = true
+
+	watch := "0"
+	if state.Watch {
+		watch = "1"
+	}
+	var commands [][]string
+	appendSet := func(changed bool, key, value string) {
+		if changed {
+			commands = append(commands, []string{"set-option", "-p", "-t", paneID, "@" + key, value})
+		}
+	}
+	appendSet(!previous.WatchSet || previous.Watch != state.Watch, WatchOption, watch)
+	appendSet(previous.Since != state.Since, SinceOption, strconv.FormatInt(state.Since, 10))
+	appendSet(previous.Changed != state.Changed, ChangedOption, strconv.FormatInt(state.Changed, 10))
+	appendSet(previous.Proc != state.Proc, ProcOption, state.Proc)
+	// State is last so readers never see a new state with stale companion
+	// fields while tmux processes the command batch.
+	appendSet(previous.State != state.State, StateOption, string(state.State))
+
+	switch {
+	case previous.State != StateUnread && state.State == StateUnread:
+		commands = append(commands, tmux.WindowAdjustmentArgs(paneID, WindowUnreadCountOption, 1))
+	case previous.State == StateUnread && state.State != StateUnread:
+		commands = append(commands, tmux.WindowAdjustmentArgs(paneID, WindowUnreadCountOption, -1))
+	}
+	return runCommands(commands...)
 }
 
 // Clear unsets the complete pane contract. Clearing an unread pane also
@@ -231,23 +253,19 @@ func Clear(target string) error {
 		return err
 	}
 	return withPaneLock(paneID, func() error {
-		previous, err := showPaneVar(paneID, StateOption)
+		previous, err := readPaneState(paneID)
 		if err != nil {
 			return err
 		}
 
-		var errs []error
+		var commands [][]string
 		for _, key := range []string{WatchOption, StateOption, SinceOption, ChangedOption, HashOption, ProcOption, FiredOption} {
-			if err := unsetPaneVar(paneID, key); err != nil {
-				errs = append(errs, err)
-			}
+			commands = append(commands, []string{"set-option", "-p", "-u", "-t", paneID, "@" + key})
 		}
-		if AttentionState(previous) == StateUnread {
-			if err := adjustWindowVar(paneID, WindowUnreadCountOption, -1); err != nil {
-				errs = append(errs, err)
-			}
+		if previous.State == StateUnread {
+			commands = append(commands, tmux.WindowAdjustmentArgs(paneID, WindowUnreadCountOption, -1))
 		}
-		return errors.Join(errs...)
+		return runCommands(commands...)
 	})
 }
 
@@ -259,28 +277,50 @@ func ReconcileWindowUnreadCounts() error {
 	if err != nil {
 		return err
 	}
+	return ReconcileWindowUnreadCountsFromSnapshot(states)
+}
 
-	counts := make(map[string]int)
+// ReconcileWindowUnreadCountsFromSnapshot repairs aggregates using an
+// existing roll call. Only drifted windows are written, all in one tmux
+// invocation.
+func ReconcileWindowUnreadCountsFromSnapshot(states []PaneState) error {
+	type aggregate struct {
+		current int
+		want    int
+	}
+	counts := make(map[string]aggregate)
 	for _, state := range states {
 		target := windowTarget(state)
 		if target == "" {
 			continue
 		}
-		if _, exists := counts[target]; !exists {
-			counts[target] = 0
+		count, exists := counts[target]
+		if !exists {
+			count.current = state.WindowUnreadCount
 		}
 		if state.State == StateUnread {
-			counts[target]++
+			count.want++
 		}
+		counts[target] = count
 	}
 
-	var errs []error
-	for target, count := range counts {
-		if err := setWindowVar(target, WindowUnreadCountOption, strconv.Itoa(count)); err != nil {
-			errs = append(errs, err)
+	targets := make([]string, 0, len(counts))
+	for target := range counts {
+		targets = append(targets, target)
+	}
+	sort.Strings(targets)
+
+	var commands [][]string
+	for _, target := range targets {
+		count := counts[target]
+		if count.current != count.want {
+			commands = append(commands, []string{
+				"set-option", "-w", "-t", target,
+				"@" + WindowUnreadCountOption, strconv.Itoa(count.want),
+			})
 		}
 	}
-	return errors.Join(errs...)
+	return runCommands(commands...)
 }
 
 func windowTarget(state PaneState) string {
@@ -291,6 +331,15 @@ func windowTarget(state PaneState) string {
 		return ""
 	}
 	return fmt.Sprintf("=%s:%d", state.Session, state.WindowIndex)
+}
+
+func samePublicState(left, right PaneState) bool {
+	return left.Watch == right.Watch &&
+		left.WatchSet == right.WatchSet &&
+		left.State == right.State &&
+		left.Since == right.Since &&
+		left.Changed == right.Changed &&
+		left.Proc == right.Proc
 }
 
 func withPaneLock(paneID string, operation func() error) error {

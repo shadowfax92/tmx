@@ -33,9 +33,16 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 		t.Fatalf("Get() error = %v", err)
 	}
 	if got.ID != "%1" || !got.Watch || !got.WatchSet || got.State != StateUnread ||
-		got.Since != 1234 || got.Changed != 1200 || got.Hash != "screen-a" ||
-		got.Proc != "claude" || !got.Fired {
+		got.Since != 1234 || got.Changed != 1200 || got.Hash != "" ||
+		got.Proc != "claude" || got.Fired {
 		t.Fatalf("Get() = %#v, want written contract", got)
+	}
+	if fake.batchCalls != 1 {
+		t.Fatalf("Set() tmux batches = %d, want 1", fake.batchCalls)
+	}
+	firstBatch := strings.Join(fake.batches[0], " ")
+	if strings.Contains(firstBatch, "@attn_hash") || strings.Contains(firstBatch, "@attn_fired") {
+		t.Fatalf("daemon-private fields leaked into tmux batch: %q", firstBatch)
 	}
 	if fake.windowCount != 1 {
 		t.Fatalf("window unread count = %d, want 1", fake.windowCount)
@@ -77,11 +84,21 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 	}
 }
 
+func TestParsePaneStatePreservesMissingLeadingOptionsAfterTmuxTrimming(t *testing.T) {
+	got, err := parsePaneState("_\t\t\t\t\t\t_", "%1")
+	if err != nil {
+		t.Fatalf("parsePaneState() error = %v", err)
+	}
+	if got.WatchSet || got.State != "" || got.Since != 0 || got.Changed != 0 || got.Proc != "" {
+		t.Fatalf("parsePaneState() = %#v, want absent public state", got)
+	}
+}
+
 func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	fake := newFakeStateBackend()
 	fake.listOutput = strings.Join([]string{
-		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "review", "claude", "", "/tmp/a", "1", "unread", "42", "40", "hash-a", "claude", "1", "_"}, "\t"),
-		strings.Join([]string{"%2", "other:3.1", "other", "3", "shell", "1", "202", "", "zsh", "", "/tmp/b", "", "", "", "", "", "", "", "_"}, "\t"),
+		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "review", "claude", "", "/tmp/a", "@1", "100", "1", "1", "unread", "42", "40", "claude", "_"}, "\t"),
+		strings.Join([]string{"%2", "other:3.1", "other", "3", "shell", "1", "202", "", "zsh", "", "/tmp/b", "@2", "200", "0", "", "", "", "", "", "_"}, "\t"),
 	}, "\n")
 	stubStateBackend(t, fake)
 
@@ -94,18 +111,23 @@ func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	}
 	for _, option := range []string{
 		"#{@attn_watch}", "#{@attn_state}", "#{@attn_since}", "#{@attn_changed}",
-		"#{@attn_hash}", "#{@attn_proc}", "#{@attn_fired}",
+		"#{@attn_proc}", "#{window_activity}", "#{@attn_unread_count}",
 	} {
 		if !strings.Contains(fake.listFormat, option) {
 			t.Fatalf("snapshot format %q missing %s", fake.listFormat, option)
 		}
 	}
+	if strings.Contains(fake.listFormat, "#{@attn_hash}") ||
+		strings.Contains(fake.listFormat, "#{@attn_fired}") {
+		t.Fatalf("snapshot format still reads daemon-private fields: %q", fake.listFormat)
+	}
 	if len(got) != 2 {
 		t.Fatalf("Snapshot() returned %d panes, want 2", len(got))
 	}
 	if got[0].ID != "%1" || !got[0].Watch || got[0].State != StateUnread ||
-		got[0].Since != 42 || got[0].Changed != 40 || got[0].Hash != "hash-a" ||
-		got[0].Proc != "claude" || !got[0].Fired {
+		got[0].Since != 42 || got[0].Changed != 40 || got[0].Hash != "" ||
+		got[0].Proc != "claude" || got[0].Fired || got[0].WindowID != "@1" ||
+		got[0].WindowActivity != 100 || got[0].WindowUnreadCount != 1 {
 		t.Fatalf("watched snapshot = %#v", got[0])
 	}
 	if got[1].ID != "%2" || got[1].WatchSet || got[1].State != "" || got[1].Since != 0 ||
@@ -128,8 +150,8 @@ func TestSnapshotTreatsMissingTmuxServerAsEmpty(t *testing.T) {
 func TestReconcileWindowUnreadCountsDropsOrphanedPaneCount(t *testing.T) {
 	fake := newFakeStateBackend()
 	fake.listOutput = strings.Join([]string{
-		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "", "claude", "", "/tmp/a", "1", "quiet", "42", "40", "hash-a", "claude", "1", "_"}, "\t"),
-		strings.Join([]string{"%2", "work:2.0", "work", "2", "other", "0", "202", "", "codex", "", "/tmp/b", "1", "unread", "43", "41", "hash-b", "codex", "1", "_"}, "\t"),
+		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "", "claude", "", "/tmp/a", "@1", "90", "2", "1", "quiet", "42", "40", "claude", "_"}, "\t"),
+		strings.Join([]string{"%2", "work:2.0", "work", "2", "other", "0", "202", "", "codex", "", "/tmp/b", "@2", "91", "0", "1", "unread", "43", "41", "codex", "_"}, "\t"),
 	}, "\n")
 	stubStateBackend(t, fake)
 
@@ -141,6 +163,34 @@ func TestReconcileWindowUnreadCountsDropsOrphanedPaneCount(t *testing.T) {
 	}
 	if got := fake.windowValues["work:2"]; got != "1" {
 		t.Fatalf("work:2 unread count = %q, want 1", got)
+	}
+	if fake.listCalls != 1 || fake.batchCalls != 1 {
+		t.Fatalf("reconcile list calls=%d batches=%d, want one reused inventory and one write batch",
+			fake.listCalls, fake.batchCalls)
+	}
+}
+
+func TestDaemonTransitionDefersWhenCLIChangedSnapshotState(t *testing.T) {
+	fake := newFakeStateBackend()
+	fake.options["%1"] = map[string]string{
+		WatchOption: "0", StateOption: string(StateQuiet),
+		SinceOption: "200", ChangedOption: "100", ProcOption: "101:claude",
+	}
+	stubStateBackend(t, fake)
+
+	expected := PaneState{
+		Watch: true, WatchSet: true, State: StateActive,
+		Since: 100, Changed: 0, Proc: "101:claude",
+	}
+	next := expected
+	next.State = StateQuiet
+	next.Changed = 100
+	err := setPaneStateIfCurrent("%1", expected, next)
+	if !errors.Is(err, errPaneStateDrift) {
+		t.Fatalf("setPaneStateIfCurrent() error = %v, want state drift", err)
+	}
+	if fake.batchCalls != 0 {
+		t.Fatalf("state drift wrote %d tmux batches, want 0", fake.batchCalls)
 	}
 }
 
@@ -232,6 +282,8 @@ type fakeStateBackend struct {
 	listErr           error
 	lastDisplayTarget string
 	windowValues      map[string]string
+	batchCalls        int
+	batches           [][]string
 }
 
 func newFakeStateBackend() *fakeStateBackend {
@@ -245,9 +297,7 @@ func newFakeStateBackend() *fakeStateBackend {
 func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 	t.Helper()
 	originalList, originalDisplay := listPanesFormat, displayPaneFormat
-	originalShow, originalSet := showPaneVar, setPaneVar
-	originalUnset, originalAdjust := unsetPaneVar, adjustWindowVar
-	originalSetWindow := setWindowVar
+	originalRunCommands := runCommands
 	originalLock, originalUnlock := lockState, unlockState
 
 	listPanesFormat = func(format string) (string, error) {
@@ -255,49 +305,37 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 		fake.listFormat = format
 		return fake.listOutput, fake.listErr
 	}
-	displayPaneFormat = func(target, _ string) (string, error) {
+	displayPaneFormat = func(target, format string) (string, error) {
 		fake.mu.Lock()
 		defer fake.mu.Unlock()
+		if format == paneStateFormat {
+			options := fake.options[target]
+			return strings.Join([]string{
+				"_",
+				options[WatchOption],
+				options[StateOption],
+				options[SinceOption],
+				options[ChangedOption],
+				options[ProcOption],
+				"_",
+			}, "\t"), nil
+		}
 		fake.lastDisplayTarget = target
 		if resolved, ok := fake.resolutions[target]; ok {
 			return resolved, nil
 		}
 		return target, nil
 	}
-	showPaneVar = func(target, key string) (string, error) {
+	runCommands = func(commands ...[]string) error {
 		fake.mu.Lock()
 		defer fake.mu.Unlock()
-		return fake.options[target][key], nil
-	}
-	setPaneVar = func(target, key, value string) error {
-		fake.mu.Lock()
-		defer fake.mu.Unlock()
-		if fake.options[target] == nil {
-			fake.options[target] = make(map[string]string)
+		fake.batchCalls++
+		var flattened []string
+		for _, command := range commands {
+			flattened = append(flattened, command...)
+			fake.applyCommand(command)
 		}
-		fake.options[target][key] = value
-		return nil
-	}
-	unsetPaneVar = func(target, key string) error {
-		fake.mu.Lock()
-		defer fake.mu.Unlock()
-		delete(fake.options[target], key)
-		return nil
-	}
-	adjustWindowVar = func(_ string, _ string, delta int) error {
-		fake.mu.Lock()
-		defer fake.mu.Unlock()
-		fake.adjustments = append(fake.adjustments, delta)
-		fake.windowCount += delta
-		if fake.windowCount < 0 {
-			fake.windowCount = 0
-		}
-		return nil
-	}
-	setWindowVar = func(target, _ string, value string) error {
-		fake.mu.Lock()
-		defer fake.mu.Unlock()
-		fake.windowValues[target] = value
+		fake.batches = append(fake.batches, flattened)
 		return nil
 	}
 	lockState = func(_ string) error {
@@ -310,9 +348,37 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 	}
 	t.Cleanup(func() {
 		listPanesFormat, displayPaneFormat = originalList, originalDisplay
-		showPaneVar, setPaneVar = originalShow, originalSet
-		unsetPaneVar, adjustWindowVar = originalUnset, originalAdjust
-		setWindowVar = originalSetWindow
+		runCommands = originalRunCommands
 		lockState, unlockState = originalLock, originalUnlock
 	})
+}
+
+func (fake *fakeStateBackend) applyCommand(command []string) {
+	if len(command) < 6 || command[0] != "set-option" {
+		return
+	}
+	switch {
+	case command[1] == "-p" && command[2] == "-t":
+		target, key, value := command[3], strings.TrimPrefix(command[4], "@"), command[5]
+		if fake.options[target] == nil {
+			fake.options[target] = make(map[string]string)
+		}
+		fake.options[target][key] = value
+	case command[1] == "-p" && command[2] == "-u":
+		target, key := command[4], strings.TrimPrefix(command[5], "@")
+		delete(fake.options[target], key)
+	case command[1] == "-w" && command[2] == "-F":
+		format := command[6]
+		delta := -1
+		if strings.Contains(format, "#{e|+:") {
+			delta = 1
+		}
+		fake.adjustments = append(fake.adjustments, delta)
+		fake.windowCount += delta
+		if fake.windowCount < 0 {
+			fake.windowCount = 0
+		}
+	case command[1] == "-w" && command[2] == "-t":
+		fake.windowValues[command[3]] = command[5]
+	}
 }
