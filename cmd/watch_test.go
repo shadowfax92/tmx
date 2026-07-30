@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -87,6 +88,95 @@ func TestWatchRunLoadsResolvedConfig(t *testing.T) {
 		strings.Join(got.Agents, ",") != "claude,codex" {
 		t.Fatalf("watch options = %+v, want resolved defaults", got)
 	}
+}
+
+func TestWatchListShowsEveryTrackedPaneInPriorityOrder(t *testing.T) {
+	states := []attn.PaneState{
+		inboxState("%active", "work:3.0", attn.StateActive, true, 400, "", "build"),
+		inboxState("%new", "work:1.1", attn.StateUnread, true, 200, "new", "review"),
+		inboxState("%unwatched", "work:4.0", attn.StateQuiet, false, 50, "done", "done"),
+		inboxState("%quiet", "work:2.0", attn.StateQuiet, true, 300, "", "agent"),
+		inboxState("%old", "other:7.2", attn.StateUnread, true, 100, "old", "review"),
+		{PaneInfo: tmux.PaneInfo{ID: "%untracked", Target: "work:5.0"}, State: attn.StateUnread},
+	}
+	for i := range states {
+		states[i].Proc = "codex"
+	}
+	stubWatchList(t, states)
+
+	output, err := executeWatchCommand("ls")
+	if err != nil {
+		t.Fatalf("watch ls error = %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
+	wantOrder := []string{"other:7.2", "work:1.1", "work:2.0", "work:3.0", "work:4.0"}
+	if len(lines) != len(wantOrder) {
+		t.Fatalf("watch ls line count = %d, want %d:\n%s", len(lines), len(wantOrder), output)
+	}
+	for i, target := range wantOrder {
+		if !strings.Contains(lines[i], target) {
+			t.Fatalf("watch ls line %d = %q, want %q", i, lines[i], target)
+		}
+	}
+	for _, want := range []string{"unread", "15m", "quiet", "active", "unwatched", "codex", "build", "done"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("watch ls output missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "%untracked") {
+		t.Fatalf("watch ls included pane without @attn_watch:\n%s", output)
+	}
+}
+
+func TestWatchListJSONQuietAndEmptyOutputs(t *testing.T) {
+	states := []attn.PaneState{
+		inboxState("%quiet", "work:2.0", attn.StateQuiet, true, 300, "", "agent"),
+		inboxState("%unread", "work:1.0", attn.StateUnread, true, 100, "review", "agent"),
+	}
+	states[0].Proc, states[1].Proc = "claude", "codex"
+	stubWatchList(t, states)
+
+	output, err := executeWatchCommand("ls", "--json", "-q")
+	if err != nil {
+		t.Fatalf("watch ls --json error = %v", err)
+	}
+	var got []watchListJSONEntry
+	if err := json.Unmarshal([]byte(output), &got); err != nil {
+		t.Fatalf("decoding watch ls JSON: %v\n%s", err, output)
+	}
+	if len(got) != 2 || got[0].Target != "work:1.0" || got[0].State != "unread" ||
+		got[0].Age != "15m" || got[0].AgeSeconds != 900 || got[0].Since != 100 ||
+		got[0].Process != "codex" || got[0].Label != "review" {
+		t.Fatalf("watch ls JSON = %#v", got)
+	}
+
+	output, err = executeWatchCommand("l", "-q")
+	if err != nil || output != "work:1.0\nwork:2.0\n" {
+		t.Fatalf("watch l -q = %q, %v", output, err)
+	}
+
+	stubWatchList(t, nil)
+	if output, err = executeWatchCommand("ls"); err != nil || output != emptyWatchListMessage+"\n" {
+		t.Fatalf("empty watch ls = %q, %v", output, err)
+	}
+	if output, err = executeWatchCommand("ls", "--json"); err != nil || output != "[]\n" {
+		t.Fatalf("empty watch ls --json = %q, %v", output, err)
+	}
+	if output, err = executeWatchCommand("ls", "-q"); err != nil || output != "" {
+		t.Fatalf("empty watch ls -q = %q, %v", output, err)
+	}
+}
+
+func stubWatchList(t *testing.T, states []attn.PaneState) {
+	t.Helper()
+	originalList, originalNow := listWatchPanes, watchListNow
+	t.Cleanup(func() {
+		listWatchPanes, watchListNow = originalList, originalNow
+	})
+	listWatchPanes = func() ([]attn.PaneState, error) {
+		return append([]attn.PaneState(nil), states...), nil
+	}
+	watchListNow = func() time.Time { return time.Unix(1000, 0) }
 }
 
 func TestWatchReapUsesConfiguredTTLAndFlagOverride(t *testing.T) {
