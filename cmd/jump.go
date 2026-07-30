@@ -99,30 +99,51 @@ func runJump(action config.JumpAction, focusCommand string, deps jumpDeps) error
 		return fmt.Errorf("resolving invoking client: %w", err)
 	}
 	for _, target := range unread {
-		if !deps.backend.PaneExists(target.ID) {
-			continue
-		}
-		if err := focusJumpTarget(deps.backend, client, target); err != nil {
-			if !deps.backend.PaneExists(target.ID) {
-				continue
-			}
+		jumped, err := jumpToTarget(action, focusCommand, client, target, deps)
+		if err != nil {
 			return err
 		}
-		if err := deps.markRead(target); err != nil {
-			if !deps.backend.PaneExists(target.ID) {
-				continue
-			}
-			return fmt.Errorf("clearing unread on %s: %w", target.ID, err)
+		if jumped {
+			return nil
 		}
-		if err := applyJumpAction(deps.backend, action, focusCommand, target.ID); err != nil {
-			if !deps.backend.PaneExists(target.ID) {
-				continue
-			}
-			return err
-		}
-		return nil
 	}
 	return deps.backend.DisplayMessage(client, "inbox zero")
+}
+
+// jumpToTarget is the shared selected-pane path for `jump` and `inbox`.
+// It returns false when the pane disappears during navigation so queue-based
+// callers can continue to the next live candidate.
+func jumpToTarget(
+	action config.JumpAction,
+	focusCommand string,
+	client string,
+	target attn.PaneState,
+	deps jumpDeps,
+) (bool, error) {
+	if !deps.backend.PaneExists(target.ID) {
+		return false, nil
+	}
+	if err := focusJumpTarget(deps.backend, client, target); err != nil {
+		if !deps.backend.PaneExists(target.ID) {
+			return false, nil
+		}
+		return false, err
+	}
+	if target.State == attn.StateUnread {
+		if err := deps.markRead(target); err != nil {
+			if !deps.backend.PaneExists(target.ID) {
+				return false, nil
+			}
+			return false, fmt.Errorf("clearing unread on %s: %w", target.ID, err)
+		}
+	}
+	if err := applyJumpAction(deps.backend, action, focusCommand, target.ID); err != nil {
+		if !deps.backend.PaneExists(target.ID) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func focusJumpTarget(backend jumpBackend, client string, target attn.PaneState) error {
