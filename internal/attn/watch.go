@@ -73,9 +73,11 @@ type Watcher struct {
 }
 
 type watchedPane struct {
-	current   PaneState
-	published PaneState
-	pending   *PaneState
+	current             PaneState
+	published           PaneState
+	pending             *PaneState
+	readBaselinePending bool
+	readBaselineSource  string
 }
 
 // ReapCandidate is a live attention pane whose screen has not changed past
@@ -290,12 +292,22 @@ func (w *Watcher) Tick(now time.Time) error {
 				current:   observed,
 				published: publicState(observed),
 			}
+			if hasReadBaseline(observed) {
+				memory.readBaselinePending = true
+				memory.readBaselineSource = "restart"
+			}
 			w.panes[pane.ID] = memory
 		} else if !samePublicState(observed, memory.published) {
-			reconcilePublishedState(&memory.current, memory.published, observed)
+			readAcknowledged := reconcilePublishedState(&memory.current, memory.published, observed)
 			memory.published = publicState(observed)
 			memory.pending = nil
+			memory.readBaselinePending = false
+			memory.readBaselineSource = ""
 			w.logf("external transition pane=%s state=%s watch=%t", pane.ID, observed.State, observed.Watch)
+			if readAcknowledged {
+				memory.readBaselinePending = true
+				memory.readBaselineSource = "external"
+			}
 		}
 
 		memory.current.PaneInfo = pane.PaneInfo
@@ -307,7 +319,9 @@ func (w *Watcher) Tick(now time.Time) error {
 		windowKey := activityWindowKey(observed)
 		previousActivity, sawWindow := w.windowActivity[windowKey]
 		idleWindow := sawWindow && previousActivity == observed.WindowActivity
-		firstCapture := !known || hash == ""
+		firstCapture := !known || hash == "" || memory.readBaselinePending
+		currentReadHash := ""
+		readBaselineChanged := false
 		if memory.pending != nil {
 			desired := *memory.pending
 			if err := watchSet(pane.ID, memory.published, desired); err != nil {
@@ -327,7 +341,11 @@ func (w *Watcher) Tick(now time.Time) error {
 			continue
 		}
 		if firstCapture || !idleWindow {
-			captured, err := watchCapture(pane.ID, w.options.CaptureLines)
+			captureLines := w.options.CaptureLines
+			if memory.current.ReadLines > captureLines {
+				captureLines = memory.current.ReadLines
+			}
+			captured, err := watchCapture(pane.ID, captureLines)
 			if err != nil {
 				// The pane may have disappeared between discovery and capture.
 				w.logf("capture pane=%s error: %v", pane.ID, err)
@@ -335,6 +353,34 @@ func (w *Watcher) Tick(now time.Time) error {
 				continue
 			}
 			hash = screenHash(captured, w.options.CaptureLines)
+			if hasReadBaseline(memory.current) {
+				currentReadHash = screenHash(captured, memory.current.ReadLines)
+			}
+			if memory.readBaselinePending {
+				source := memory.readBaselineSource
+				memory.readBaselinePending = false
+				memory.readBaselineSource = ""
+				if currentReadHash == memory.current.ReadHash {
+					memory.current.Hash = hash
+					memory.current.Fired = true
+					w.logf(
+						"read baseline adopted pane=%s source=%s baseline=%s lines=%d",
+						pane.ID, source, shortHash(memory.current.ReadHash), memory.current.ReadLines,
+					)
+				} else {
+					// The screen changed after it was acknowledged. An empty
+					// private hash forces observePane to begin a new episode.
+					memory.current.Hash = ""
+					readBaselineChanged = true
+					w.logf(
+						"read baseline changed pane=%s baseline=%s current=%s lines=%d rearm=true",
+						pane.ID,
+						shortHash(memory.current.ReadHash),
+						shortHash(currentReadHash),
+						memory.current.ReadLines,
+					)
+				}
+			}
 			if !known && observed.WatchSet && !observed.Watch {
 				// Preserve an explicit opt-out across a daemon restart while
 				// still learning the first private screen hash.
@@ -353,7 +399,27 @@ func (w *Watcher) Tick(now time.Time) error {
 			now,
 			w.options.quietThreshold(),
 		)
+		if next.ReadHash != "" && next.ReadLines <= 0 {
+			next.ReadLines = w.options.CaptureLines
+		}
 		memory.current = next
+		if previous.ReadHash != "" && next.ReadHash == "" && next.State == StateActive {
+			if !readBaselineChanged && previous.Hash != hash {
+				w.logf(
+					"read baseline changed pane=%s baseline=%s current=%s lines=%d rearm=true",
+					pane.ID,
+					shortHash(previous.ReadHash),
+					shortHash(currentReadHash),
+					previous.ReadLines,
+				)
+			} else if previous.Proc != "" && pane.ProcessFingerprint != "" &&
+				previous.Proc != pane.ProcessFingerprint {
+				w.logf(
+					"read baseline invalidated pane=%s reason=process-change proc=%q->%q rearm=true",
+					pane.ID, previous.Proc, pane.ProcessFingerprint,
+				)
+			}
+		}
 
 		desired := desiredPublicState(next, memory.published)
 		if samePublicState(desired, memory.published) {
@@ -411,17 +477,20 @@ func (w *Watcher) Tick(now time.Time) error {
 
 func hasAttentionState(state PaneState) bool {
 	return state.WatchSet || state.State != "" || state.Since != 0 ||
-		state.Changed != 0 || state.Proc != ""
+		state.Changed != 0 || state.Proc != "" || state.ReadHash != "" ||
+		state.ReadLines != 0
 }
 
 func publicState(state PaneState) PaneState {
 	return PaneState{
-		Watch:    state.Watch,
-		WatchSet: state.WatchSet,
-		State:    state.State,
-		Since:    state.Since,
-		Changed:  state.Changed,
-		Proc:     state.Proc,
+		Watch:     state.Watch,
+		WatchSet:  state.WatchSet,
+		State:     state.State,
+		Since:     state.Since,
+		Changed:   state.Changed,
+		Proc:      state.Proc,
+		ReadHash:  state.ReadHash,
+		ReadLines: state.ReadLines,
 	}
 }
 
@@ -443,11 +512,18 @@ func desiredPublicState(current, published PaneState) PaneState {
 	return desired
 }
 
-func reconcilePublishedState(current *PaneState, published, observed PaneState) {
+func reconcilePublishedState(current *PaneState, published, observed PaneState) bool {
 	externalEpisodeChange := published.Watch != observed.Watch ||
 		published.WatchSet != observed.WatchSet ||
 		published.State != observed.State ||
-		published.Since != observed.Since
+		published.Since != observed.Since ||
+		published.ReadHash != observed.ReadHash ||
+		published.ReadLines != observed.ReadLines
+	readAcknowledged := hasReadBaseline(observed) &&
+		(published.State != StateQuiet ||
+			published.Since != observed.Since ||
+			published.ReadHash != observed.ReadHash ||
+			published.ReadLines != observed.ReadLines)
 	if published.Watch != observed.Watch || published.WatchSet != observed.WatchSet {
 		current.Watch = observed.Watch
 		current.WatchSet = observed.WatchSet
@@ -464,9 +540,20 @@ func reconcilePublishedState(current *PaneState, published, observed PaneState) 
 	if published.Proc != observed.Proc {
 		current.Proc = observed.Proc
 	}
+	if published.ReadHash != observed.ReadHash {
+		current.ReadHash = observed.ReadHash
+	}
+	if published.ReadLines != observed.ReadLines {
+		current.ReadLines = observed.ReadLines
+	}
 	if externalEpisodeChange {
 		current.Fired = observed.State != StateActive
 	}
+	return readAcknowledged
+}
+
+func hasReadBaseline(state PaneState) bool {
+	return state.State == StateQuiet && state.ReadHash != "" && state.ReadLines > 0
 }
 
 func updateSnapshotPublicState(states map[string]PaneState, paneID string, public PaneState) {
@@ -477,6 +564,8 @@ func updateSnapshotPublicState(states map[string]PaneState, paneID string, publi
 	state.Since = public.Since
 	state.Changed = public.Changed
 	state.Proc = public.Proc
+	state.ReadHash = public.ReadHash
+	state.ReadLines = public.ReadLines
 	states[paneID] = state
 }
 
@@ -487,6 +576,8 @@ func clearPublicState(state *PaneState) {
 	state.Since = 0
 	state.Changed = 0
 	state.Proc = ""
+	state.ReadHash = ""
+	state.ReadLines = 0
 }
 
 func adjustSnapshotWindowCount(states map[string]PaneState, pane PaneState, delta int) {
@@ -557,6 +648,8 @@ func observePane(
 		next.Hash = hash
 		next.Proc = process
 		next.Fired = false
+		next.ReadHash = ""
+		next.ReadLines = 0
 		return next, true
 	}
 
@@ -577,6 +670,8 @@ func observePane(
 			next.Hash = hash
 			next.Proc = process
 			next.Fired = false
+			next.ReadHash = ""
+			next.ReadLines = 0
 			return next, true
 		}
 		if next.Proc == "" && process != "" {
@@ -593,6 +688,8 @@ func observePane(
 			next.Changed = nowUnix
 			next.Hash = hash
 			next.Fired = false
+			next.ReadHash = ""
+			next.ReadLines = 0
 		}
 		if !validState(next.State) {
 			next.State = StateActive
@@ -608,6 +705,8 @@ func observePane(
 		next.Hash = hash
 		next.Proc = process
 		next.Fired = false
+		next.ReadHash = ""
+		next.ReadLines = 0
 		return next, true
 	}
 	if next.Proc == "" && process != "" {
@@ -628,6 +727,7 @@ func observePane(
 				// The user is already looking at the pane, so consume this
 				// episode without briefly creating an unread badge.
 				next.State = StateQuiet
+				next.ReadHash = hash
 			} else {
 				next.State = StateUnread
 			}
@@ -639,11 +739,14 @@ func observePane(
 		if focused {
 			next.State = StateQuiet
 			next.Since = nowUnix
+			next.ReadHash = hash
 		}
 	default:
 		next.State = StateActive
 		next.Since = nowUnix
 		next.Fired = false
+		next.ReadHash = ""
+		next.ReadLines = 0
 	}
 	return next, !sameWatchFields(state, next)
 }
@@ -660,7 +763,18 @@ func sameWatchFields(left, right PaneState) bool {
 		left.Changed == right.Changed &&
 		left.Hash == right.Hash &&
 		left.Proc == right.Proc &&
-		left.Fired == right.Fired
+		left.Fired == right.Fired &&
+		left.ReadHash == right.ReadHash &&
+		left.ReadLines == right.ReadLines
+}
+
+// CaptureScreenHash captures and hashes the same screen tail used by the watcher.
+func CaptureScreenHash(target string, lineLimit int) (string, error) {
+	captured, err := tmux.CapturePane(target, lineLimit)
+	if err != nil {
+		return "", err
+	}
+	return screenHash(captured, lineLimit), nil
 }
 
 // screenHash strips terminal controls and hashes only the configured tail.
@@ -673,6 +787,13 @@ func screenHash(captured string, lineLimit int) string {
 	}
 	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
 	return hex.EncodeToString(sum[:])
+}
+
+func shortHash(hash string) string {
+	if len(hash) <= 12 {
+		return hash
+	}
+	return hash[:12]
 }
 
 // DaemonPaths holds per-tmux-socket watcher state.
@@ -708,6 +829,27 @@ func CurrentDaemonPaths() (DaemonPaths, error) {
 		PIDFile: filepath.Join(dir, "watch.pid"),
 		LogFile: filepath.Join(dir, "watch.log"),
 	}, nil
+}
+
+// AppendWatcherLog adds a CLI-side diagnostic to the current socket's watcher log.
+func AppendWatcherLog(format string, args ...any) error {
+	paths, err := CurrentDaemonPaths()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(paths.Dir, 0700); err != nil {
+		return err
+	}
+	if err := os.Chmod(paths.Dir, 0700); err != nil {
+		return err
+	}
+	logFile, err := os.OpenFile(paths.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	logger := log.New(logFile, "", log.LstdFlags|log.Lmicroseconds)
+	writeErr := logger.Output(2, fmt.Sprintf(format, args...))
+	return errors.Join(writeErr, logFile.Close())
 }
 
 func encodeStateComponent(value string) string {

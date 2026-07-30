@@ -5,7 +5,6 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
-	"time"
 
 	"tmx/internal/attn"
 	"tmx/internal/config"
@@ -209,8 +208,18 @@ func applyJumpAction(backend jumpBackend, action config.JumpAction, focusCommand
 }
 
 func markPaneRead(state attn.PaneState) error {
-	state.State = attn.StateQuiet
-	state.Since = time.Now().Unix()
-	state.Fired = true
-	return attn.Set(state.ID, state)
+	next, baseline, err := prepareAttentionRead(state)
+	if err != nil {
+		_ = logAttentionEvent("read failed pane=%s error=%v", state.ID, err)
+		return err
+	}
+	if err := setAttentionState(state.ID, next); err != nil {
+		_ = logAttentionEvent("read failed pane=%s error=%v", state.ID, err)
+		return err
+	}
+	_ = logAttentionEvent(
+		"read acknowledged pane=%s baseline=%s lines=%d proc=%q",
+		state.ID, shortAttentionHash(baseline.Hash), baseline.Lines, baseline.Process,
+	)
+	return nil
 }

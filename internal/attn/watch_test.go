@@ -52,12 +52,18 @@ func TestObservePaneFlagsExactlyOncePerQuietEpisodeAndRearmsOnChange(t *testing.
 
 	state, changed = observePane(state, "screen-a", "claude", true, unixTime(301), quietFor)
 	assertWatchState(t, state, changed, StateQuiet, true, true)
+	if state.ReadHash != "screen-a" {
+		t.Fatalf("visited read baseline = %q, want current screen hash", state.ReadHash)
+	}
 
 	state, changed = observePane(state, "screen-a", "claude", false, unixTime(500), quietFor)
 	assertWatchState(t, state, changed, StateQuiet, false, true)
 
 	state, changed = observePane(state, "screen-b", "claude", false, unixTime(501), quietFor)
 	assertWatchState(t, state, changed, StateActive, true, false)
+	if state.ReadHash != "" {
+		t.Fatalf("changed screen retained read baseline %q", state.ReadHash)
+	}
 
 	state, changed = observePane(state, "screen-b", "claude", false, unixTime(502), quietFor)
 	assertWatchState(t, state, changed, StateQuiet, true, false)
@@ -79,9 +85,28 @@ func TestObservePaneConsumesQuietEpisodeWhenAlreadyFocused(t *testing.T) {
 
 	state, changed := observePane(state, "screen", "claude", true, unixTime(190), 90*time.Second)
 	assertWatchState(t, state, changed, StateQuiet, true, true)
+	if state.ReadHash != "screen" {
+		t.Fatalf("focused quiet baseline = %q, want current screen hash", state.ReadHash)
+	}
 
 	state, changed = observePane(state, "screen", "claude", false, unixTime(400), 90*time.Second)
 	assertWatchState(t, state, changed, StateQuiet, false, true)
+}
+
+func TestObservePaneReadBaselineDoesNotConsumeLaterProcessChange(t *testing.T) {
+	state := PaneState{
+		Watch: true, WatchSet: true, State: StateQuiet,
+		Since: 100, Changed: 90, Hash: "screen", Proc: "101:claude", Fired: true,
+		ReadHash: "screen", ReadLines: 30,
+	}
+
+	next, changed := observePane(
+		state, "screen", "202:claude", false, unixTime(200), 90*time.Second,
+	)
+	assertWatchState(t, next, changed, StateActive, true, false)
+	if next.Proc != "202:claude" || next.ReadHash != "" || next.ReadLines != 0 {
+		t.Fatalf("later process state = %#v, want re-armed with cleared read baseline", next)
+	}
 }
 
 func TestObservePaneUnwatchedNeverFlagsAndProcessChangeRearms(t *testing.T) {
@@ -409,6 +434,159 @@ func TestWatcherReconcilesCLIChangesAndRearmsUnwatchOnProcessChange(t *testing.T
 	)
 	if len(selection.Candidates) != 1 || selection.Candidates[0].ID != "%1" {
 		t.Fatalf("reap selection after quiet transition = %#v", selection)
+	}
+}
+
+func TestWatcherAdoptsExternalReadBaselineBeforeComparingScreen(t *testing.T) {
+	options := WatchOptions{
+		Poll: time.Second, GracePeriods: 30, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	}
+	watcher, err := NewWatcher(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	watcher.logger = logForTest(&logs)
+
+	beforeRead := PaneState{
+		PaneInfo:       tmux.PaneInfo{ID: "%1", Target: "work:1.0", Session: "work", WindowIndex: 1},
+		WindowID:       "@1",
+		WindowActivity: 100,
+		Watch:          true,
+		WatchSet:       true,
+		State:          StateUnread,
+		Since:          90,
+		Changed:        80,
+		Proc:           "101:claude",
+		Fired:          true,
+	}
+	private := beforeRead
+	private.Hash = screenHash("screen before focus", options.CaptureLines)
+	watcher.panes["%1"] = &watchedPane{
+		current:   private,
+		published: publicState(beforeRead),
+	}
+
+	screen := "screen after focus"
+	baseline := screenHash(screen, options.CaptureLines)
+	process := "202:claude"
+	rollCall := beforeRead
+	rollCall.State = StateQuiet
+	rollCall.Since = 100
+	rollCall.Proc = process
+	rollCall.ReadHash = baseline
+	rollCall.ReadLines = options.CaptureLines
+	rollCall.WindowActivity = 101
+	var writes []PaneState
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) { return []PaneState{rollCall}, nil },
+		discover: func([]string) ([]DiscoveredPane, error) {
+			return []DiscoveredPane{{
+				PaneInfo: rollCall.PaneInfo, ProcessFingerprint: process,
+			}}, nil
+		},
+		focused: func() (map[string]bool, error) { return map[string]bool{"%1": true}, nil },
+		capture: func(string, int) (string, error) { return screen, nil },
+		set: func(_ string, expected, next PaneState) error {
+			if !samePublicState(expected, rollCall) {
+				t.Fatalf("transition expected %#v, roll call %#v", expected, publicState(rollCall))
+			}
+			writes = append(writes, next)
+			applyPublicForTest(&rollCall, next)
+			return nil
+		},
+		clear:     func(string) error { return nil },
+		reconcile: func([]PaneState) error { return nil },
+	})
+
+	if err := watcher.Tick(unixTime(100)); err != nil {
+		t.Fatal(err)
+	}
+	memory := watcher.panes["%1"].current
+	if len(writes) != 0 || memory.State != StateQuiet || memory.Hash != baseline ||
+		memory.ReadHash != baseline || memory.Proc != process || !memory.Fired {
+		t.Fatalf("post-read writes=%#v memory=%#v, want quiet adopted baseline", writes, memory)
+	}
+	if !strings.Contains(logs.String(), "read baseline adopted pane=%1") {
+		t.Fatalf("watcher logs = %q, want adopted read baseline", logs.String())
+	}
+
+	screen = "genuine later output"
+	rollCall.WindowActivity = 102
+	if err := watcher.Tick(unixTime(101)); err != nil {
+		t.Fatal(err)
+	}
+	if len(writes) != 1 || writes[0].State != StateActive || writes[0].ReadHash != "" {
+		t.Fatalf("later-output writes = %#v, want active with cleared read baseline", writes)
+	}
+	if !strings.Contains(logs.String(), "read baseline changed pane=%1") ||
+		!strings.Contains(logs.String(), "rearm=true") {
+		t.Fatalf("watcher logs = %q, want explicit baseline-change rearm", logs.String())
+	}
+}
+
+func TestWatcherRestoresReadBaselineAfterRestart(t *testing.T) {
+	options := WatchOptions{
+		Poll: time.Second, GracePeriods: 30, Period: time.Second,
+		CaptureLines: 2, Agents: []string{"claude"},
+	}
+	watcher, err := NewWatcher(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	watcher.logger = logForTest(&logs)
+
+	screen := "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"
+	baselineLines := 7
+	baseline := screenHash(screen, baselineLines)
+	rollingHash := screenHash(screen, options.CaptureLines)
+	rollCall := PaneState{
+		PaneInfo:       tmux.PaneInfo{ID: "%1", Target: "work:1.0"},
+		WindowID:       "@1",
+		WindowActivity: 100,
+		Watch:          true,
+		WatchSet:       true,
+		State:          StateQuiet,
+		Since:          90,
+		Changed:        80,
+		Proc:           "101:claude",
+		ReadHash:       baseline,
+		ReadLines:      baselineLines,
+	}
+	writes := 0
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) { return []PaneState{rollCall}, nil },
+		discover: func([]string) ([]DiscoveredPane, error) {
+			return []DiscoveredPane{{
+				PaneInfo: rollCall.PaneInfo, ProcessFingerprint: "101:claude",
+			}}, nil
+		},
+		focused: func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture: func(_ string, lines int) (string, error) {
+			if lines != baselineLines {
+				t.Fatalf("capture lines = %d, want baseline-compatible %d", lines, baselineLines)
+			}
+			return screen, nil
+		},
+		set: func(string, PaneState, PaneState) error {
+			writes++
+			return nil
+		},
+		clear:     func(string) error { return nil },
+		reconcile: func([]PaneState) error { return nil },
+	})
+
+	if err := watcher.Tick(unixTime(100)); err != nil {
+		t.Fatal(err)
+	}
+	memory := watcher.panes["%1"].current
+	if writes != 0 || memory.State != StateQuiet || memory.Hash != rollingHash || !memory.Fired {
+		t.Fatalf("restart writes=%d memory=%#v, want restored quiet baseline", writes, memory)
+	}
+	if !strings.Contains(logs.String(), "read baseline adopted pane=%1 source=restart") {
+		t.Fatalf("watcher logs = %q, want restart baseline adoption", logs.String())
 	}
 }
 
@@ -1093,6 +1271,26 @@ func TestCurrentDaemonPathsArePerSocketUnderStateDir(t *testing.T) {
 	}
 }
 
+func TestAppendWatcherLogWritesCLIEventToSocketLog(t *testing.T) {
+	t.Setenv("TMX_STATE_DIR", t.TempDir())
+	t.Setenv("TMUX", "/tmp/tmux-501/dev,123,0")
+
+	if err := AppendWatcherLog("read acknowledged pane=%s baseline=%s", "%1", "abc123"); err != nil {
+		t.Fatalf("AppendWatcherLog() error = %v", err)
+	}
+	paths, err := CurrentDaemonPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(paths.LogFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(content); !strings.Contains(got, "read acknowledged pane=%1 baseline=abc123") {
+		t.Fatalf("watcher log = %q, want CLI event", got)
+	}
+}
+
 func unixTime(seconds int64) time.Time {
 	return time.Unix(seconds, 0)
 }
@@ -1108,6 +1306,7 @@ func applyPublicForTest(state *PaneState, public PaneState) {
 	state.Since = public.Since
 	state.Changed = public.Changed
 	state.Proc = public.Proc
+	state.ReadHash = public.ReadHash
 }
 
 func assertWatchState(

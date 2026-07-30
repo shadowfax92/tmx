@@ -242,13 +242,14 @@ and server it describes. The watcher and attention commands maintain:
 | `@attn_state` | pane | `active`, `quiet`, or `unread` |
 | `@attn_since` | pane | Unix time when the current state began |
 | `@attn_changed` | pane | Unix time of the last material screen change |
-| `@attn_hash` | pane | hash of the last captured screen tail |
 | `@attn_proc` | pane | process fingerprint used to detect a new task |
-| `@attn_fired` | pane | whether the current quiet episode already fired |
+| `@attn_read_hash` | pane | hash of the screen tail acknowledged by the most recent read |
+| `@attn_read_lines` | pane | line count used to calculate the acknowledged screen hash |
 | `@attn_unread_count` | window | number of unread panes in that window |
 
 Status formats should read only `@attn_state` and `@attn_unread_count`; use
 `tmx mark`, `tmx snooze`, and `tmx unwatch` rather than editing options by hand.
+The watcher keeps its rolling screen hash and per-episode fired flag private.
 
 ## How scratch popups work
 
