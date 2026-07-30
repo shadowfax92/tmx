@@ -6,9 +6,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"tmx/internal/attn"
 	"tmx/internal/config"
+	"tmx/internal/tmux"
 )
 
 func TestWatchStartReportsStartedAndAlreadyRunning(t *testing.T) {
@@ -87,13 +89,158 @@ func TestWatchRunLoadsResolvedConfig(t *testing.T) {
 	}
 }
 
+func TestWatchReapUsesConfiguredTTLAndFlagOverride(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	originalFind, originalNow := findWatchReap, watchReapNow
+	t.Cleanup(func() {
+		findWatchReap, watchReapNow = originalFind, originalNow
+	})
+	watchReapNow = func() time.Time { return time.Unix(100, 0) }
+
+	var gotTTL time.Duration
+	findWatchReap = func(ttl time.Duration, _ time.Time) (attn.ReapSelection, error) {
+		gotTTL = ttl
+		return attn.ReapSelection{}, nil
+	}
+	if output, err := executeWatchCommand("reap", "--dry-run"); err != nil ||
+		output != "No stale agent panes matched.\n" {
+		t.Fatalf("default reap = %q, %v", output, err)
+	}
+	if gotTTL != config.DefaultWatchReapTTL {
+		t.Fatalf("default reap TTL = %v, want %v", gotTTL, config.DefaultWatchReapTTL)
+	}
+
+	if _, err := executeWatchCommand("reap", "--dry-run", "--ttl", "2h"); err != nil {
+		t.Fatalf("override reap error = %v", err)
+	}
+	if gotTTL != 2*time.Hour {
+		t.Fatalf("override reap TTL = %v, want 2h", gotTTL)
+	}
+}
+
+func TestWatchReapDryRunListsNamesAndAgesWithoutKilling(t *testing.T) {
+	originalFind, originalReap := findWatchReap, reapWatchPanes
+	t.Cleanup(func() {
+		findWatchReap, reapWatchPanes = originalFind, originalReap
+	})
+	findWatchReap = func(time.Duration, time.Time) (attn.ReapSelection, error) {
+		return attn.ReapSelection{
+			Candidates: []attn.ReapCandidate{
+				watchReapCandidate("%1", "work:1.0", "review", 49*time.Hour),
+				watchReapCandidate("%2", "work:2.0", "", 25*time.Hour),
+			},
+			MissingTimestamps: 1,
+		}, nil
+	}
+	reapCalls := 0
+	reapWatchPanes = func([]attn.ReapCandidate) (attn.ReapReport, error) {
+		reapCalls++
+		return attn.ReapReport{}, nil
+	}
+
+	output, err := executeWatchCommand("reap", "--dry-run", "--ttl", "24h")
+	if err != nil {
+		t.Fatalf("dry-run error = %v", err)
+	}
+	for _, want := range []string{
+		"Would reap 2 stale agent panes:",
+		"work:1.0 (review)",
+		"unchanged 2d",
+		"work:2.0",
+		"unchanged 1d",
+		"Skipped 1 attention pane without a last-change timestamp.",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("dry-run output missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "[y/N]") || reapCalls != 0 {
+		t.Fatalf("dry-run prompted or killed: calls=%d output=%q", reapCalls, output)
+	}
+}
+
+func TestWatchReapConfirmsOnceThenKillsWholeList(t *testing.T) {
+	originalFind, originalReap := findWatchReap, reapWatchPanes
+	t.Cleanup(func() {
+		findWatchReap, reapWatchPanes = originalFind, originalReap
+	})
+	candidates := []attn.ReapCandidate{
+		watchReapCandidate("%1", "work:1.0", "review", 2*24*time.Hour),
+		watchReapCandidate("%2", "work:2.0", "", 25*time.Hour),
+	}
+	findWatchReap = func(time.Duration, time.Time) (attn.ReapSelection, error) {
+		return attn.ReapSelection{Candidates: candidates}, nil
+	}
+	reapCalls := 0
+	reapWatchPanes = func(got []attn.ReapCandidate) (attn.ReapReport, error) {
+		reapCalls++
+		if len(got) != 2 || got[0].ID != "%1" || got[1].ID != "%2" {
+			t.Fatalf("confirmed candidates = %#v", got)
+		}
+		return attn.ReapReport{Removed: got}, nil
+	}
+
+	output, err := executeWatchCommandWithInput("y\n", "reap", "--ttl", "24h")
+	if err != nil {
+		t.Fatalf("confirmed reap error = %v", err)
+	}
+	if strings.Count(output, "[y/N]") != 1 || reapCalls != 1 {
+		t.Fatalf("confirmation count/calls = %d/%d:\n%s", strings.Count(output, "[y/N]"), reapCalls, output)
+	}
+	if !strings.Contains(output, "Stale agent panes (2):") ||
+		!strings.Contains(output, "Reaped 2 stale agent panes.") {
+		t.Fatalf("confirmed reap output:\n%s", output)
+	}
+}
+
+func TestWatchReapDeclineKillsNothing(t *testing.T) {
+	originalFind, originalReap := findWatchReap, reapWatchPanes
+	t.Cleanup(func() {
+		findWatchReap, reapWatchPanes = originalFind, originalReap
+	})
+	findWatchReap = func(time.Duration, time.Time) (attn.ReapSelection, error) {
+		return attn.ReapSelection{
+			Candidates: []attn.ReapCandidate{
+				watchReapCandidate("%1", "work:1.0", "", 2*24*time.Hour),
+			},
+		}, nil
+	}
+	reapCalls := 0
+	reapWatchPanes = func([]attn.ReapCandidate) (attn.ReapReport, error) {
+		reapCalls++
+		return attn.ReapReport{}, nil
+	}
+
+	output, err := executeWatchCommandWithInput("n\n", "reap", "--ttl", "24h")
+	if err != nil {
+		t.Fatalf("declined reap error = %v", err)
+	}
+	if reapCalls != 0 || !strings.Contains(output, "No panes reaped.") {
+		t.Fatalf("declined reap calls=%d output=%q", reapCalls, output)
+	}
+}
+
+func watchReapCandidate(id, target, label string, age time.Duration) attn.ReapCandidate {
+	return attn.ReapCandidate{
+		PaneState: attn.PaneState{
+			PaneInfo: tmux.PaneInfo{ID: id, Target: target, Label: label},
+		},
+		Age: age,
+	}
+}
+
 func executeWatchCommand(args ...string) (string, error) {
+	return executeWatchCommandWithInput("", args...)
+}
+
+func executeWatchCommandWithInput(input string, args ...string) (string, error) {
 	command := newWatchCommand()
 	command.SilenceErrors = true
 	command.SilenceUsage = true
 	var output bytes.Buffer
 	command.SetOut(&output)
 	command.SetErr(&output)
+	command.SetIn(strings.NewReader(input))
 	command.SetArgs(args)
 	err := command.Execute()
 	return output.String(), err

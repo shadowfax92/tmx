@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -54,6 +55,7 @@ var (
 	watchFocused   = tmux.FocusedPaneIDs
 	watchSet       = Set
 	watchClear     = Clear
+	watchKillPane  = tmux.KillPane
 	watchReconcile = ReconcileWindowUnreadCounts
 )
 
@@ -64,11 +66,132 @@ type Watcher struct {
 	options WatchOptions
 }
 
+// ReapCandidate is a live attention pane whose screen has not changed past
+// the reap threshold.
+type ReapCandidate struct {
+	PaneState
+	LastChanged time.Time
+	Age         time.Duration
+}
+
+func (c ReapCandidate) DisplayName() string {
+	name := c.Target
+	if name == "" {
+		name = c.ID
+	}
+	if c.Label != "" {
+		return fmt.Sprintf("%s (%s)", name, c.Label)
+	}
+	return name
+}
+
+// ReapSelection reports selectable panes and attention panes skipped because
+// the watcher has not recorded a last-screen-change timestamp for them.
+type ReapSelection struct {
+	Candidates        []ReapCandidate
+	MissingTimestamps int
+}
+
+type ReapFailure struct {
+	Candidate ReapCandidate
+	Err       error
+}
+
+type ReapReport struct {
+	Removed   []ReapCandidate
+	Protected []ReapCandidate
+	Failed    []ReapFailure
+}
+
 func NewWatcher(options WatchOptions) (*Watcher, error) {
 	if err := options.validate(); err != nil {
 		return nil, err
 	}
 	return &Watcher{options: options}, nil
+}
+
+// FindReapCandidates selects live, non-focused attention panes based only on
+// the last screen change recorded by the watcher. Explicitly unwatched panes
+// remain eligible; missing timestamps are never guessed by the reap command.
+func FindReapCandidates(ttl time.Duration, now time.Time) (ReapSelection, error) {
+	if ttl <= 0 {
+		return ReapSelection{}, errors.New("reap ttl must be greater than zero")
+	}
+	states, err := watchSnapshot()
+	if err != nil {
+		return ReapSelection{}, err
+	}
+	focused, err := watchFocused()
+	if err != nil {
+		return ReapSelection{}, err
+	}
+	return selectReapCandidates(states, focused, ttl, now), nil
+}
+
+func selectReapCandidates(
+	states []PaneState,
+	focused map[string]bool,
+	ttl time.Duration,
+	now time.Time,
+) ReapSelection {
+	var selection ReapSelection
+	for _, state := range states {
+		if focused[state.ID] || !hasAttentionState(state) {
+			continue
+		}
+		if state.Changed <= 0 {
+			selection.MissingTimestamps++
+			continue
+		}
+		lastChanged := time.Unix(state.Changed, 0)
+		age := now.Sub(lastChanged)
+		if age <= ttl {
+			continue
+		}
+		selection.Candidates = append(selection.Candidates, ReapCandidate{
+			PaneState:   state,
+			LastChanged: lastChanged,
+			Age:         age,
+		})
+	}
+	sort.Slice(selection.Candidates, func(i, j int) bool {
+		left, right := selection.Candidates[i], selection.Candidates[j]
+		if !left.LastChanged.Equal(right.LastChanged) {
+			return left.LastChanged.Before(right.LastChanged)
+		}
+		return left.Target < right.Target
+	})
+	return selection
+}
+
+// ReapPanes protects panes focused since selection, kills the rest, and then
+// repairs window aggregates from the surviving pane inventory. Successful
+// kill-pane calls remove pane-scoped attention state with the pane itself.
+func ReapPanes(candidates []ReapCandidate) (ReapReport, error) {
+	var report ReapReport
+	var errs []error
+	focused, err := watchFocused()
+	if err != nil {
+		return report, fmt.Errorf("checking focused panes before reap: %w", err)
+	}
+	for _, candidate := range candidates {
+		if focused[candidate.ID] {
+			report.Protected = append(report.Protected, candidate)
+			continue
+		}
+		if err := watchKillPane(candidate.ID); err != nil {
+			wrapped := fmt.Errorf("killing %s: %w", candidate.ID, err)
+			report.Failed = append(report.Failed, ReapFailure{Candidate: candidate, Err: wrapped})
+			errs = append(errs, wrapped)
+			continue
+		}
+		report.Removed = append(report.Removed, candidate)
+	}
+	if err := watchReconcile(); err != nil {
+		wrapped := fmt.Errorf("reconciling attention counts: %w", err)
+		errs = append(errs, wrapped)
+	}
+	return report, errors.Join(errs...)
 }
 
 // Run polls immediately and then at the configured interval until cancelled
@@ -160,7 +283,7 @@ func (w *Watcher) Tick(now time.Time) error {
 
 func hasAttentionState(state PaneState) bool {
 	return state.WatchSet || state.State != "" || state.Since != 0 ||
-		state.Hash != "" || state.Proc != "" || state.Fired
+		state.Changed != 0 || state.Hash != "" || state.Proc != "" || state.Fired
 }
 
 // observePane is the pure episode state machine. Fired is intentionally
@@ -182,10 +305,18 @@ func observePane(
 		next.WatchSet = true
 		next.State = StateActive
 		next.Since = nowUnix
+		next.Changed = nowUnix
 		next.Hash = hash
 		next.Proc = process
 		next.Fired = false
 		return next, true
+	}
+
+	// Older watcher state has no dedicated screen-change timestamp. Initialize
+	// it to now, which deliberately underestimates age instead of guessing that
+	// the pane is stale.
+	if next.Changed == 0 {
+		next.Changed = nowUnix
 	}
 
 	processChanged := state.Proc != "" && process != "" && state.Proc != process
@@ -194,6 +325,7 @@ func observePane(
 			next.Watch = true
 			next.State = StateActive
 			next.Since = nowUnix
+			next.Changed = nowUnix
 			next.Hash = hash
 			next.Proc = process
 			next.Fired = false
@@ -210,6 +342,7 @@ func observePane(
 		if next.Hash != hash {
 			next.State = StateActive
 			next.Since = nowUnix
+			next.Changed = nowUnix
 			next.Hash = hash
 			next.Fired = false
 		}
@@ -223,6 +356,7 @@ func observePane(
 	if processChanged || state.Hash == "" || state.Hash != hash {
 		next.State = StateActive
 		next.Since = nowUnix
+		next.Changed = nowUnix
 		next.Hash = hash
 		next.Proc = process
 		next.Fired = false
@@ -275,6 +409,7 @@ func sameWatchFields(left, right PaneState) bool {
 		left.WatchSet == right.WatchSet &&
 		left.State == right.State &&
 		left.Since == right.Since &&
+		left.Changed == right.Changed &&
 		left.Hash == right.Hash &&
 		left.Proc == right.Proc &&
 		left.Fired == right.Fired

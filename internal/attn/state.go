@@ -13,6 +13,7 @@ const (
 	WatchOption             = "attn_watch"
 	StateOption             = "attn_state"
 	SinceOption             = "attn_since"
+	ChangedOption           = "attn_changed"
 	HashOption              = "attn_hash"
 	ProcOption              = "attn_proc"
 	FiredOption             = "attn_fired"
@@ -35,12 +36,13 @@ type PaneState struct {
 	WatchSet bool
 	State    AttentionState
 	Since    int64
+	Changed  int64
 	Hash     string
 	Proc     string
 	Fired    bool
 }
 
-const snapshotFormat = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{@fip_buffer}\t#{pane_current_path}\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_hash}\t#{@attn_proc}\t#{@attn_fired}\t_"
+const snapshotFormat = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{@fip_buffer}\t#{pane_current_path}\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_changed}\t#{@attn_hash}\t#{@attn_proc}\t#{@attn_fired}\t_"
 
 var (
 	listPanesFormat   = tmux.ListPanesFormat
@@ -59,6 +61,10 @@ var (
 func Snapshot() ([]PaneState, error) {
 	out, err := listPanesFormat(snapshotFormat)
 	if err != nil {
+		if strings.Contains(err.Error(), "no server running") ||
+			strings.Contains(err.Error(), "no sessions") {
+			return nil, nil
+		}
 		return nil, err
 	}
 	if out == "" {
@@ -67,14 +73,15 @@ func Snapshot() ([]PaneState, error) {
 
 	var states []PaneState
 	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "\t", 18)
-		if len(parts) != 18 {
+		parts := strings.SplitN(line, "\t", 19)
+		if len(parts) != 19 {
 			continue
 		}
 		windowIndex, _ := strconv.Atoi(parts[3])
 		paneIndex, _ := strconv.Atoi(parts[5])
 		pid, _ := strconv.Atoi(parts[6])
 		since, _ := strconv.ParseInt(parts[13], 10, 64)
+		changed, _ := strconv.ParseInt(parts[14], 10, 64)
 		states = append(states, PaneState{
 			PaneInfo: tmux.PaneInfo{
 				ID:          parts[0],
@@ -93,9 +100,10 @@ func Snapshot() ([]PaneState, error) {
 			WatchSet: parts[11] != "",
 			State:    AttentionState(parts[12]),
 			Since:    since,
-			Hash:     parts[14],
-			Proc:     parts[15],
-			Fired:    parts[16] == "1",
+			Changed:  changed,
+			Hash:     parts[15],
+			Proc:     parts[16],
+			Fired:    parts[17] == "1",
 		})
 	}
 	return states, nil
@@ -140,8 +148,8 @@ func Get(target string) (PaneState, error) {
 }
 
 func readPaneState(paneID string) (PaneState, error) {
-	values := make([]string, 6)
-	for i, key := range []string{WatchOption, StateOption, SinceOption, HashOption, ProcOption, FiredOption} {
+	values := make([]string, 7)
+	for i, key := range []string{WatchOption, StateOption, SinceOption, ChangedOption, HashOption, ProcOption, FiredOption} {
 		value, err := showPaneVar(paneID, key)
 		if err != nil {
 			return PaneState{}, err
@@ -149,14 +157,16 @@ func readPaneState(paneID string) (PaneState, error) {
 		values[i] = value
 	}
 	since, _ := strconv.ParseInt(values[2], 10, 64)
+	changed, _ := strconv.ParseInt(values[3], 10, 64)
 	return PaneState{
 		Watch:    values[0] == "1",
 		WatchSet: values[0] != "",
 		State:    AttentionState(values[1]),
 		Since:    since,
-		Hash:     values[3],
-		Proc:     values[4],
-		Fired:    values[5] == "1",
+		Changed:  changed,
+		Hash:     values[4],
+		Proc:     values[5],
+		Fired:    values[6] == "1",
 	}, nil
 }
 
@@ -190,6 +200,7 @@ func Set(target string, state PaneState) error {
 		}{
 			{WatchOption, watch},
 			{SinceOption, strconv.FormatInt(state.Since, 10)},
+			{ChangedOption, strconv.FormatInt(state.Changed, 10)},
 			{HashOption, state.Hash},
 			{ProcOption, state.Proc},
 			{FiredOption, fired},
@@ -226,7 +237,7 @@ func Clear(target string) error {
 		}
 
 		var errs []error
-		for _, key := range []string{WatchOption, StateOption, SinceOption, HashOption, ProcOption, FiredOption} {
+		for _, key := range []string{WatchOption, StateOption, SinceOption, ChangedOption, HashOption, ProcOption, FiredOption} {
 			if err := unsetPaneVar(paneID, key); err != nil {
 				errs = append(errs, err)
 			}
