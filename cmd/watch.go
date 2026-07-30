@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,15 +21,34 @@ import (
 
 var errWatcherStopped = errors.New("watcher stopped")
 
+const emptyWatchListMessage = "No tracked agent panes."
+
 var (
 	startWatchDaemon  = attn.StartDaemon
 	stopWatchDaemon   = attn.StopDaemon
 	statusWatchDaemon = attn.StatusDaemon
 	runWatchDaemon    = attn.RunDaemon
+	listWatchPanes    = attn.Snapshot
 	findWatchReap     = attn.FindReapCandidates
 	reapWatchPanes    = attn.ReapPanes
+	watchListNow      = time.Now
 	watchReapNow      = time.Now
 )
+
+type watchListEntry struct {
+	inboxEntry
+	Process string
+}
+
+type watchListJSONEntry struct {
+	Target     string `json:"target"`
+	State      string `json:"state"`
+	Age        string `json:"age"`
+	AgeSeconds int64  `json:"age_seconds"`
+	Since      int64  `json:"since"`
+	Process    string `json:"process"`
+	Label      string `json:"label"`
+}
 
 func init() {
 	rootCmd.AddCommand(newWatchCommand())
@@ -117,9 +137,90 @@ func newWatchCommand() *cobra.Command {
 				})
 			},
 		},
+		newWatchListCommand(),
 		newWatchReapCommand(),
 	)
 	return watch
+}
+
+func newWatchListCommand() *cobra.Command {
+	list := &cobra.Command{
+		Use:     "ls",
+		Aliases: []string{"l"},
+		Short:   "List panes tracked by the attention watcher",
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			states, err := listWatchPanes()
+			if err != nil {
+				return err
+			}
+			states = watchedInboxStates(states)
+			sortInboxStates(states)
+
+			entries := make([]watchListEntry, 0, len(states))
+			for _, state := range states {
+				entry := watchListEntry{inboxEntry: makeInboxEntry(state, watchListNow())}
+				entry.Process = sanitizeInboxField(state.Proc)
+				if entry.Process == "" {
+					entry.Process = "-"
+				}
+				entries = append(entries, entry)
+			}
+
+			jsonOut, _ := cmd.Flags().GetBool("json")
+			quiet, _ := cmd.Flags().GetBool("quiet")
+			switch {
+			case jsonOut:
+				return printWatchListJSON(cmd.OutOrStdout(), entries)
+			case quiet:
+				for _, entry := range entries {
+					fmt.Fprintln(cmd.OutOrStdout(), entry.Target)
+				}
+			case len(entries) == 0:
+				_, err = fmt.Fprintln(cmd.OutOrStdout(), emptyWatchListMessage)
+				return err
+			default:
+				printWatchList(cmd.OutOrStdout(), entries)
+			}
+			return nil
+		},
+	}
+	list.Flags().Bool("json", false, "Print tracked panes as JSON")
+	list.Flags().BoolP("quiet", "q", false, "Print targets only")
+	return list
+}
+
+func printWatchList(w io.Writer, entries []watchListEntry) {
+	targetWidth, stateWidth, ageWidth, processWidth := 6, 5, 3, 7
+	for _, entry := range entries {
+		targetWidth = max(targetWidth, len(entry.Target))
+		stateWidth = max(stateWidth, len(entry.State))
+		ageWidth = max(ageWidth, len(entry.Age))
+		processWidth = max(processWidth, len(entry.Process))
+	}
+	for _, entry := range entries {
+		fmt.Fprintf(w, "%-*s  %-*s  %-*s  %-*s  %s\n",
+			targetWidth, entry.Target,
+			stateWidth, entry.State,
+			ageWidth, entry.Age,
+			processWidth, entry.Process,
+			entry.Label,
+		)
+	}
+}
+
+func printWatchListJSON(w io.Writer, entries []watchListEntry) error {
+	output := make([]watchListJSONEntry, 0, len(entries))
+	for _, entry := range entries {
+		output = append(output, watchListJSONEntry{
+			Target: entry.Target, State: entry.State, Age: entry.Age,
+			AgeSeconds: entry.AgeSecs, Since: entry.PaneState.Since,
+			Process: entry.Process, Label: entry.Label,
+		})
+	}
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(output)
 }
 
 func newWatchReapCommand() *cobra.Command {
