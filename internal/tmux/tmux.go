@@ -219,6 +219,67 @@ func SetPaneVar(target, key, value string) error {
 	return err
 }
 
+func UnsetPaneVar(target, key string) error {
+	_, err := run("set-option", "-p", "-u", "-t", target, "@"+key)
+	return err
+}
+
+func ShowPaneVar(target, key string) (string, error) {
+	return run("show-options", "-p", "-q", "-v", "-t", target, "@"+key)
+}
+
+func SetWindowVar(target, key, value string) error {
+	_, err := run("set-option", "-w", "-t", target, "@"+key, value)
+	return err
+}
+
+func UnsetWindowVar(target, key string) error {
+	_, err := run("set-option", "-w", "-u", "-t", target, "@"+key)
+	return err
+}
+
+func ShowWindowVar(target, key string) (string, error) {
+	return run("show-options", "-w", "-q", "-v", "-t", target, "@"+key)
+}
+
+// AdjustWindowVar changes an integer window option inside the tmux server.
+// Negative results are clamped at zero. Expanding the old value and setting
+// the new one in one command prevents concurrent clear operations from
+// driving counters below zero.
+func AdjustWindowVar(target, key string, delta int) error {
+	if delta == 0 {
+		return nil
+	}
+	_, err := run("set-option", "-w", "-F", "-t", target, "@"+key, windowAdjustmentFormat(key, delta))
+	return err
+}
+
+func windowAdjustmentFormat(key string, delta int) string {
+	option := "#{@" + key + "}"
+	if delta > 0 {
+		return fmt.Sprintf("#{e|+:%s,%d}", option, delta)
+	}
+	amount := -delta
+	return fmt.Sprintf("#{?#{e|>:%s,%d},#{e|-:%s,%d},0}", option, amount, option, amount)
+}
+
+// DisplayPaneFormat expands format for the pane resolved by target. A target
+// may itself identify a pane, window, or session.
+func DisplayPaneFormat(target, format string) (string, error) {
+	args := []string{"display-message"}
+	if target != "" {
+		args = append(args, "-t", target)
+	}
+	args = append(args, "-p", format)
+	return run(args...)
+}
+
+// ListPanesFormat expands format for every pane on the tmux server in one
+// list-panes pass.
+func ListPanesFormat(format string) (string, error) {
+	return run("list-panes", "-a", "-F", format)
+}
+
 func SetCurrentPaneLabel(value string) error {
 	target, err := PaneID()
 	if err != nil {
@@ -232,8 +293,7 @@ func UnsetCurrentPaneLabel() error {
 	if err != nil {
 		return err
 	}
-	_, err = run("set-option", "-p", "-t", target, "-u", "@pane_label")
-	return err
+	return UnsetPaneVar(target, "pane_label")
 }
 
 func UnsetSessionVar(session, key string) error {
