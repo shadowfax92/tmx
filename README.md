@@ -173,13 +173,24 @@ Live pane/window state stays in tmux; watcher lifecycle files (`watch.pid`,
 override that location.
 
 Visiting an unread pane clears it within one watcher tick; `tmx jump` clears it
-immediately. New screen activity re-arms the episode. `tmx snooze` gives the
-current pane a fresh unread timestamp so it moves to the back of the
-oldest-first queue. `tmx unwatch` is an explicit opt-out; it re-arms when the
-foreground agent process changes. `tmx watch stop` applies the same opt-out to
-multiple panes, using an fzf multi-select when no targets are supplied.
-`tmx watch stop --daemon` stops the detached watcher process. `tmx watch reap`
-handles abandoned panes older than `watch.reap_ttl`, with a dry-run and y/N
+immediately. For instant focus-driven clearing regardless of the watcher poll
+interval, add this hook to your tmux configuration:
+
+```tmux
+set-hook -g pane-focus-in "run-shell 'tmx mark read --if-unread -t \"#{hook_pane}\"'"
+```
+
+The `--if-unread` mode is a silent no-op unless the target pane is unread. The
+hook passes `#{hook_pane}` explicitly because it identifies the pane that fired
+the event. `tmx init` does not install this hook.
+
+New screen activity re-arms the episode. `tmx snooze` gives the current pane a
+fresh unread timestamp so it moves to the back of the oldest-first queue.
+`tmx unwatch` is an explicit opt-out; it re-arms when the foreground agent
+process changes. `tmx watch stop` applies the same opt-out to multiple panes,
+using an fzf multi-select when no targets are supplied. `tmx watch stop
+--daemon` stops the detached watcher process. `tmx watch reap` handles
+abandoned panes older than `watch.reap_ttl`, with a dry-run and y/N
 confirmation.
 
 Run the watcher on every server start alongside the key initialization:

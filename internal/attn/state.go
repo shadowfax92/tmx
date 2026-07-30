@@ -54,6 +54,7 @@ const (
 var (
 	listPanesFormat   = tmux.ListPanesFormat
 	displayPaneFormat = tmux.DisplayPaneFormat
+	showPaneVar       = tmux.ShowPaneVar
 	runCommands       = tmux.RunCommands
 	lockState         = tmux.WaitForLock
 	unlockState       = tmux.WaitForUnlock
@@ -183,6 +184,9 @@ func parsePaneState(out, paneID string) (PaneState, error) {
 // Set writes the complete pane contract and updates the window unread count
 // when the pane crosses the unread boundary.
 func Set(target string, state PaneState) error {
+	if err := validatePaneState(state); err != nil {
+		return err
+	}
 	paneID, err := ResolveTarget(target)
 	if err != nil {
 		return err
@@ -193,6 +197,45 @@ func Set(target string, state PaneState) error {
 			return err
 		}
 		return writePaneState(paneID, previous, state)
+	})
+}
+
+// UpdateIfUnread applies update only while target is unread. The common no-op
+// path reads only @attn_state; resolution, locking, and the full state read are
+// deferred until that option says unread. The state is checked again under the
+// pane lock so a concurrent transition wins instead of being overwritten.
+func UpdateIfUnread(target string, update func(PaneState) PaneState) error {
+	current, err := showPaneVar(normalizeTarget(target), StateOption)
+	if err != nil {
+		return err
+	}
+	if AttentionState(current) != StateUnread {
+		return nil
+	}
+
+	paneID, err := ResolveTarget(target)
+	if err != nil {
+		return err
+	}
+	return withPaneLock(paneID, func() error {
+		current, err := showPaneVar(paneID, StateOption)
+		if err != nil {
+			return err
+		}
+		if AttentionState(current) != StateUnread {
+			return nil
+		}
+
+		state, err := readPaneState(paneID)
+		if err != nil {
+			return err
+		}
+		state.ID = paneID
+		next := update(state)
+		if err := validatePaneState(next); err != nil {
+			return err
+		}
+		return writePaneState(paneID, state, next)
 	})
 }
 
@@ -212,9 +255,16 @@ func setPaneStateIfCurrent(paneID string, expected, state PaneState) error {
 	})
 }
 
-func writePaneState(paneID string, previous, state PaneState) error {
+func validatePaneState(state PaneState) error {
 	if !validState(state.State) {
 		return fmt.Errorf("invalid attention state %q", state.State)
+	}
+	return nil
+}
+
+func writePaneState(paneID string, previous, state PaneState) error {
+	if err := validatePaneState(state); err != nil {
+		return err
 	}
 	state.WatchSet = true
 

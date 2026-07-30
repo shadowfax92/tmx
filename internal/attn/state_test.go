@@ -94,6 +94,112 @@ func TestParsePaneStatePreservesMissingLeadingOptionsAfterTmuxTrimming(t *testin
 	}
 }
 
+func TestUpdateIfUnreadFastPathReadsOnlyState(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		state AttentionState
+	}{
+		{name: "missing"},
+		{name: "quiet", state: StateQuiet},
+		{name: "active", state: StateActive},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := newFakeStateBackend()
+			if test.state != "" {
+				fake.options["%1"] = map[string]string{StateOption: string(test.state)}
+			}
+			stubStateBackend(t, fake)
+
+			called := false
+			err := UpdateIfUnread("%1", func(state PaneState) PaneState {
+				called = true
+				return state
+			})
+			if err != nil {
+				t.Fatalf("UpdateIfUnread() error = %v", err)
+			}
+			if called {
+				t.Fatal("UpdateIfUnread() called update for a non-unread pane")
+			}
+			if fake.showCalls != 1 || fake.displayCalls != 0 || fake.lockCalls != 0 ||
+				fake.batchCalls != 0 || len(fake.adjustments) != 0 {
+				t.Fatalf(
+					"fast-path calls = show:%d display:%d lock:%d batch:%d adjust:%v, want one show only",
+					fake.showCalls, fake.displayCalls, fake.lockCalls, fake.batchCalls, fake.adjustments,
+				)
+			}
+		})
+	}
+}
+
+func TestUpdateIfUnreadUsesSetTransitionAndRechecksUnderLock(t *testing.T) {
+	t.Run("updates unread state", func(t *testing.T) {
+		fake := newFakeStateBackend()
+		fake.options["%1"] = map[string]string{
+			WatchOption:   "1",
+			StateOption:   string(StateUnread),
+			SinceOption:   "42",
+			ChangedOption: "40",
+			HashOption:    "screen",
+			ProcOption:    "101:claude",
+			FiredOption:   "1",
+		}
+		fake.windowCount = 1
+		stubStateBackend(t, fake)
+
+		err := UpdateIfUnread("%1", func(state PaneState) PaneState {
+			if state.ID != "%1" || !state.Watch || state.Hash != "" ||
+				state.Proc != "101:claude" {
+				t.Fatalf("update state = %#v, want complete public pane state", state)
+			}
+			state.State = StateQuiet
+			state.Since = 500
+			return state
+		})
+		if err != nil {
+			t.Fatalf("UpdateIfUnread() error = %v", err)
+		}
+		if got := fake.options["%1"][StateOption]; got != string(StateQuiet) {
+			t.Fatalf("state option = %q, want quiet", got)
+		}
+		if got := fake.options["%1"][SinceOption]; got != "500" {
+			t.Fatalf("since option = %q, want 500", got)
+		}
+		if fake.windowCount != 0 || !slices.Equal(fake.adjustments, []int{-1}) {
+			t.Fatalf("window count = %d, adjustments = %v; want 0 and [-1]", fake.windowCount, fake.adjustments)
+		}
+	})
+
+	t.Run("loses concurrent transition", func(t *testing.T) {
+		fake := newFakeStateBackend()
+		fake.options["%1"] = map[string]string{StateOption: string(StateUnread)}
+		fake.onLock = func() {
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			fake.options["%1"][StateOption] = string(StateActive)
+		}
+		stubStateBackend(t, fake)
+
+		called := false
+		err := UpdateIfUnread("%1", func(state PaneState) PaneState {
+			called = true
+			return state
+		})
+		if err != nil {
+			t.Fatalf("UpdateIfUnread() error = %v", err)
+		}
+		if called || fake.batchCalls != 0 || len(fake.adjustments) != 0 {
+			t.Fatalf("race path called=%t batch=%d adjustments=%v, want no mutation", called, fake.batchCalls, fake.adjustments)
+		}
+		if fake.showCalls != 2 || fake.displayCalls != 1 || fake.lockCalls != 1 {
+			t.Fatalf(
+				"race-path calls = show:%d display:%d lock:%d, want 2, 1, 1",
+				fake.showCalls, fake.displayCalls, fake.lockCalls,
+			)
+		}
+	})
+}
+
 func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	fake := newFakeStateBackend()
 	fake.listOutput = strings.Join([]string{
@@ -276,6 +382,9 @@ type fakeStateBackend struct {
 	resolutions       map[string]string
 	windowCount       int
 	adjustments       []int
+	showCalls         int
+	displayCalls      int
+	lockCalls         int
 	listOutput        string
 	listCalls         int
 	listFormat        string
@@ -284,6 +393,7 @@ type fakeStateBackend struct {
 	windowValues      map[string]string
 	batchCalls        int
 	batches           [][]string
+	onLock            func()
 }
 
 func newFakeStateBackend() *fakeStateBackend {
@@ -297,7 +407,7 @@ func newFakeStateBackend() *fakeStateBackend {
 func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 	t.Helper()
 	originalList, originalDisplay := listPanesFormat, displayPaneFormat
-	originalRunCommands := runCommands
+	originalShow, originalRunCommands := showPaneVar, runCommands
 	originalLock, originalUnlock := lockState, unlockState
 
 	listPanesFormat = func(format string) (string, error) {
@@ -308,6 +418,8 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 	displayPaneFormat = func(target, format string) (string, error) {
 		fake.mu.Lock()
 		defer fake.mu.Unlock()
+		fake.displayCalls++
+		fake.lastDisplayTarget = target
 		if format == paneStateFormat {
 			options := fake.options[target]
 			return strings.Join([]string{
@@ -320,11 +432,16 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 				"_",
 			}, "\t"), nil
 		}
-		fake.lastDisplayTarget = target
 		if resolved, ok := fake.resolutions[target]; ok {
 			return resolved, nil
 		}
 		return target, nil
+	}
+	showPaneVar = func(target, key string) (string, error) {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		fake.showCalls++
+		return fake.options[target][key], nil
 	}
 	runCommands = func(commands ...[]string) error {
 		fake.mu.Lock()
@@ -340,6 +457,10 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 	}
 	lockState = func(_ string) error {
 		fake.stateMu.Lock()
+		fake.lockCalls++
+		if fake.onLock != nil {
+			fake.onLock()
+		}
 		return nil
 	}
 	unlockState = func(_ string) error {
@@ -348,7 +469,7 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 	}
 	t.Cleanup(func() {
 		listPanesFormat, displayPaneFormat = originalList, originalDisplay
-		runCommands = originalRunCommands
+		showPaneVar, runCommands = originalShow, originalRunCommands
 		lockState, unlockState = originalLock, originalUnlock
 	})
 }

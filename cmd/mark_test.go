@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,59 @@ func TestMarkDefaultsToCurrentPaneAndReadClearsUnread(t *testing.T) {
 	}
 	if got.state.Since != 500 {
 		t.Fatalf("mark read since = %d, want 500", got.state.Since)
+	}
+}
+
+func TestMarkReadIfUnreadClearsOnlyUnreadAndSilencesFailures(t *testing.T) {
+	t.Run("unread", func(t *testing.T) {
+		fake := newFakeAttentionCommands(t)
+		fake.states["%1"] = attn.PaneState{
+			PaneInfo: tmux.PaneInfo{ID: "%1"},
+			Watch:    true, WatchSet: true, State: attn.StateUnread, Since: 10, Fired: true,
+		}
+
+		output, err := executeAttentionCommand(newMarkCommand(), "read", "--if-unread", "-t", "%1")
+		if err != nil || output != "" {
+			t.Fatalf("mark read --if-unread = output %q, error %v; want silent success", output, err)
+		}
+		if len(fake.gotTargets) != 0 {
+			t.Fatalf("full Get targets = %v, want conditional state helper only", fake.gotTargets)
+		}
+		if got := fake.conditionalTargets; len(got) != 1 || got[0] != "%1" {
+			t.Fatalf("conditional targets = %v, want [%%1]", got)
+		}
+		got := fake.lastWrite()
+		if got.target != "%1" || got.state.State != attn.StateQuiet ||
+			got.state.Since != 500 || !got.state.Watch || !got.state.Fired {
+			t.Fatalf("conditional read write = %#v, want watched quiet pane", got)
+		}
+	})
+
+	for _, test := range []struct {
+		name  string
+		state attn.AttentionState
+		err   error
+	}{
+		{name: "quiet", state: attn.StateQuiet},
+		{name: "untracked"},
+		{name: "resolution failure", state: attn.StateUnread, err: errors.New("pane vanished")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := newFakeAttentionCommands(t)
+			fake.states["%1"] = attn.PaneState{
+				PaneInfo: tmux.PaneInfo{ID: "%1"},
+				Watch:    test.state != "", WatchSet: test.state != "", State: test.state,
+			}
+			fake.conditionalErr = test.err
+
+			output, err := executeAttentionCommand(newMarkCommand(), "read", "--if-unread", "-t", "%1")
+			if err != nil || output != "" {
+				t.Fatalf("mark read --if-unread = output %q, error %v; want silent success", output, err)
+			}
+			if len(fake.writes) != 0 {
+				t.Fatalf("writes = %#v, want none", fake.writes)
+			}
+		})
 	}
 }
 
@@ -168,13 +222,15 @@ type attentionWrite struct {
 }
 
 type fakeAttentionCommands struct {
-	states      map[string]attn.PaneState
-	resolved    map[string]string
-	discovered  []attn.DiscoveredPane
-	gotTargets  []string
-	writes      []attentionWrite
-	unreadCount int
-	inside      bool
+	states             map[string]attn.PaneState
+	resolved           map[string]string
+	discovered         []attn.DiscoveredPane
+	gotTargets         []string
+	conditionalTargets []string
+	writes             []attentionWrite
+	unreadCount        int
+	inside             bool
+	conditionalErr     error
 }
 
 func newFakeAttentionCommands(t *testing.T) *fakeAttentionCommands {
@@ -186,11 +242,13 @@ func newFakeAttentionCommands(t *testing.T) *fakeAttentionCommands {
 	}
 
 	originalGet, originalSet := getAttentionState, setAttentionState
+	originalUpdateIfUnread := updateAttentionIfUnread
 	originalDiscover, originalCurrent := discoverAttentionPanes, currentAttentionPane
 	originalInside, originalNow := insideTmux, attentionNow
 	originalLoadAgents := loadAttentionAgents
 	t.Cleanup(func() {
 		getAttentionState, setAttentionState = originalGet, originalSet
+		updateAttentionIfUnread = originalUpdateIfUnread
 		discoverAttentionPanes, currentAttentionPane = originalDiscover, originalCurrent
 		insideTmux, attentionNow = originalInside, originalNow
 		loadAttentionAgents = originalLoadAgents
@@ -220,6 +278,18 @@ func newFakeAttentionCommands(t *testing.T) *fakeAttentionCommands {
 		fake.states[target] = state
 		fake.writes = append(fake.writes, attentionWrite{target: target, state: state})
 		return nil
+	}
+	updateAttentionIfUnread = func(target string, update func(attn.PaneState) attn.PaneState) error {
+		fake.conditionalTargets = append(fake.conditionalTargets, target)
+		if fake.conditionalErr != nil {
+			return fake.conditionalErr
+		}
+		state := fake.states[target]
+		if state.State != attn.StateUnread {
+			return nil
+		}
+		next := update(state)
+		return setAttentionState(target, next)
 	}
 	discoverAttentionPanes = func([]string) ([]attn.DiscoveredPane, error) {
 		return fake.discovered, nil
