@@ -114,7 +114,13 @@ func runJump(action config.JumpAction, focusCommand string, deps jumpDeps) error
 			}
 			return fmt.Errorf("clearing unread on %s: %w", target.ID, err)
 		}
-		return applyJumpAction(deps.backend, action, focusCommand, target.ID)
+		if err := applyJumpAction(deps.backend, action, focusCommand, target.ID); err != nil {
+			if !deps.backend.PaneExists(target.ID) {
+				continue
+			}
+			return err
+		}
+		return nil
 	}
 	return deps.backend.DisplayMessage(client, "inbox zero")
 }

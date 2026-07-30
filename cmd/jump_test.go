@@ -49,11 +49,13 @@ func TestJumpActionsSelectZoomAndFocus(t *testing.T) {
 		action       config.JumpAction
 		focusCommand string
 		zoomed       bool
+		zoomedPane   string
 		wantTail     []string
 	}{
 		{name: "select", action: config.JumpActionSelect},
 		{name: "zoom", action: config.JumpActionZoom, wantTail: []string{"zoomed? %1", "zoom %1"}},
-		{name: "already zoomed", action: config.JumpActionZoom, zoomed: true, wantTail: []string{"zoomed? %1"}},
+		{name: "already zoomed", action: config.JumpActionZoom, zoomed: true, zoomedPane: "%1", wantTail: []string{"zoomed? %1"}},
+		{name: "zoomed on another pane", action: config.JumpActionZoom, zoomed: true, zoomedPane: "%other", wantTail: []string{"zoomed? %1", "zoom %1"}},
 		{name: "focus configured", action: config.JumpActionFocus, focusCommand: "focus-tool {pane}", wantTail: []string{"shell focus-tool %1"}},
 		{name: "focus unset falls back to select", action: config.JumpActionFocus},
 	}
@@ -61,6 +63,7 @@ func TestJumpActionsSelectZoomAndFocus(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			backend := newFakeJumpBackend("%1")
 			backend.zoomed = test.zoomed
+			backend.zoomedPane = test.zoomedPane
 			state := jumpState("%1", "work", 2, 10)
 			err := runJump(test.action, test.focusCommand, jumpDeps{
 				backend:  backend,
@@ -157,6 +160,33 @@ func TestJumpSkipsPaneThatVanishedAfterSnapshot(t *testing.T) {
 	}
 }
 
+func TestJumpSkipsPaneThatVanishesDuringAction(t *testing.T) {
+	states := []attn.PaneState{
+		jumpState("%gone", "gone", 1, 10),
+		jumpState("%live", "live", 2, 20),
+	}
+	backend := newFakeJumpBackend("%gone", "%live")
+	backend.vanishOnZoom = "%gone"
+	var cleared []string
+	err := runJump(config.JumpActionZoom, "", jumpDeps{
+		backend:  backend,
+		snapshot: func() ([]attn.PaneState, error) { return states, nil },
+		markRead: func(state attn.PaneState) error {
+			cleared = append(cleared, state.ID)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("runJump() error = %v", err)
+	}
+	if !slices.Equal(cleared, []string{"%gone", "%live"}) {
+		t.Fatalf("cleared panes = %#v, want vanished pane then next live pane", cleared)
+	}
+	if !slices.Contains(backend.calls, "zoom %live") {
+		t.Fatalf("next live pane was not zoomed: %#v", backend.calls)
+	}
+}
+
 func jumpState(id, session string, window int, since int64) attn.PaneState {
 	return attn.PaneState{
 		PaneInfo: tmux.PaneInfo{ID: id, Session: session, WindowIndex: window},
@@ -169,9 +199,11 @@ func jumpState(id, session string, window int, since int64) attn.PaneState {
 }
 
 type fakeJumpBackend struct {
-	live   map[string]bool
-	zoomed bool
-	calls  []string
+	live         map[string]bool
+	zoomed       bool
+	zoomedPane   string
+	vanishOnZoom string
+	calls        []string
 }
 
 func newFakeJumpBackend(live ...string) *fakeJumpBackend {
@@ -194,14 +226,24 @@ func (b *fakeJumpBackend) SelectWindow(target string) error {
 }
 func (b *fakeJumpBackend) SelectPane(target string) error {
 	b.calls = append(b.calls, "pane "+target)
+	if b.zoomed && b.zoomedPane != target {
+		b.zoomed = false
+		b.zoomedPane = ""
+	}
 	return nil
 }
 func (b *fakeJumpBackend) PaneWindowZoomed(target string) (bool, error) {
 	b.calls = append(b.calls, "zoomed? "+target)
+	if b.vanishOnZoom == target {
+		delete(b.live, target)
+		return false, errors.New("pane vanished")
+	}
 	return b.zoomed, nil
 }
 func (b *fakeJumpBackend) TogglePaneZoom(target string) error {
 	b.calls = append(b.calls, "zoom "+target)
+	b.zoomed = true
+	b.zoomedPane = target
 	return nil
 }
 func (b *fakeJumpBackend) DisplayMessage(client, message string) error {
