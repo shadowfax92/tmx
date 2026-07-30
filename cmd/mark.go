@@ -22,13 +22,14 @@ const (
 )
 
 var (
-	getAttentionState      = attn.Get
-	setAttentionState      = attn.Set
-	discoverAttentionPanes = attn.DiscoverWithFingerprints
-	currentAttentionPane   = tmux.PaneID
-	insideTmux             = tmux.IsInsideTmux
-	attentionNow           = time.Now
-	loadAttentionAgents    = func() ([]string, error) {
+	getAttentionState       = attn.Get
+	setAttentionState       = attn.Set
+	updateAttentionIfUnread = attn.UpdateIfUnread
+	discoverAttentionPanes  = attn.DiscoverWithFingerprints
+	currentAttentionPane    = tmux.PaneID
+	insideTmux              = tmux.IsInsideTmux
+	attentionNow            = time.Now
+	loadAttentionAgents     = func() ([]string, error) {
 		cfg, err := config.Load()
 		if err != nil {
 			return nil, err
@@ -49,15 +50,21 @@ func newMarkCommand() *cobra.Command {
 		Args:        cobra.NoArgs,
 	}
 	command.PersistentFlags().StringP("target", "t", "", "Target pane, window, or session (defaults to current pane)")
-	command.AddCommand(
-		&cobra.Command{
-			Use:   "read",
-			Short: "Clear an agent pane's unread flag",
-			Args:  cobra.NoArgs,
-			RunE: func(cmd *cobra.Command, args []string) error {
-				return mutateAttention(cmd, mutationRead)
-			},
+	readCommand := &cobra.Command{
+		Use:   "read",
+		Short: "Clear an agent pane's unread flag",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ifUnread, _ := cmd.Flags().GetBool("if-unread")
+			if ifUnread {
+				return markReadIfUnread(cmd)
+			}
+			return mutateAttention(cmd, mutationRead)
 		},
+	}
+	readCommand.Flags().Bool("if-unread", false, "Clear only if the pane is unread; otherwise exit silently")
+	command.AddCommand(
+		readCommand,
 		&cobra.Command{
 			Use:   "unread",
 			Short: "Flag and re-arm an agent pane",
@@ -106,6 +113,17 @@ func mutateAttention(cmd *cobra.Command, mutation attentionMutation) error {
 	return mutateAttentionTarget(target, mutation)
 }
 
+func markReadIfUnread(cmd *cobra.Command) error {
+	target, err := attentionTarget(cmd)
+	if err != nil {
+		return nil
+	}
+	// This command is intended for a high-frequency tmux hook. Its failure
+	// modes (including a pane disappearing mid-focus-hop) are all silent.
+	_ = updateAttentionIfUnread(target, markAttentionRead)
+	return nil
+}
+
 func mutateAttentionTarget(target string, mutation attentionMutation) error {
 	state, err := getAttentionState(target)
 	if err != nil {
@@ -120,9 +138,7 @@ func mutateAttentionTarget(target string, mutation attentionMutation) error {
 	next := state
 	switch mutation {
 	case mutationRead:
-		next.State = attn.StateQuiet
-		next.Since = now
-		next.Fired = true
+		next = markAttentionReadAt(next, now)
 	case mutationUnread, mutationSnooze:
 		process, err := requireAgentPane(state.ID)
 		if err != nil {
@@ -146,6 +162,17 @@ func mutateAttentionTarget(target string, mutation attentionMutation) error {
 		return fmt.Errorf("%s pane %s: %w", mutation, state.ID, err)
 	}
 	return nil
+}
+
+func markAttentionRead(state attn.PaneState) attn.PaneState {
+	return markAttentionReadAt(state, attentionNow().Unix())
+}
+
+func markAttentionReadAt(state attn.PaneState, now int64) attn.PaneState {
+	state.State = attn.StateQuiet
+	state.Since = now
+	state.Fired = true
+	return state
 }
 
 func attentionTarget(cmd *cobra.Command) (string, error) {
