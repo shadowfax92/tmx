@@ -103,6 +103,10 @@ func mutateAttention(cmd *cobra.Command, mutation attentionMutation) error {
 	if err != nil {
 		return err
 	}
+	return mutateAttentionTarget(target, mutation)
+}
+
+func mutateAttentionTarget(target string, mutation attentionMutation) error {
 	state, err := getAttentionState(target)
 	if err != nil {
 		return fmt.Errorf("resolving attention target %q: %w", target, err)

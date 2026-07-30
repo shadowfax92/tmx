@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -34,16 +36,103 @@ func TestWatchStartReportsStartedAndAlreadyRunning(t *testing.T) {
 	}
 }
 
-func TestWatchStopIsNoopWhenNotRunning(t *testing.T) {
+func TestWatchStopDaemonIsNoopWhenNotRunning(t *testing.T) {
 	original := stopWatchDaemon
 	t.Cleanup(func() { stopWatchDaemon = original })
 
 	stopWatchDaemon = func() (attn.DaemonStatus, bool, error) {
 		return attn.DaemonStatus{}, false, nil
 	}
-	output, err := executeWatchCommand("stop")
+	output, err := executeWatchCommand("stop", "--daemon")
 	if err != nil || output != "watcher not running\n" {
+		t.Fatalf("watch stop --daemon = %q, %v", output, err)
+	}
+}
+
+func TestWatchStopTTYMultiSelectUnwatchesSelectedPanes(t *testing.T) {
+	fake := newFakeAttentionCommands(t)
+	states := []attn.PaneState{
+		inboxState("%unread", "work:1.0", attn.StateUnread, true, 100, "review", "agent"),
+		inboxState("%active", "work:2.0", attn.StateActive, true, 200, "build", "agent"),
+		inboxState("%unwatched", "work:3.0", attn.StateQuiet, false, 50, "done", "agent"),
+	}
+	fake.states["%unread"], fake.states["%active"] = states[0], states[1]
+	fake.unreadCount = 1
+	stubWatchStop(t, states)
+	watchStopPick = func(prompt string, lines, args []string) ([]string, error) {
+		if prompt != "watch stop > " ||
+			len(lines) != 2 ||
+			!strings.HasPrefix(lines[0], "%unread\t") ||
+			!strings.HasPrefix(lines[1], "%active\t") {
+			t.Fatalf("watch stop picker = %q, %#v", prompt, lines)
+		}
+		if !slices.Contains(args, "-m") ||
+			!containsArgPair(args, "--preview", "tmux capture-pane -ep -t {1}") {
+			t.Fatalf("watch stop fzf args = %#v", args)
+		}
+		return []string{"%unread", "%active"}, nil
+	}
+
+	if output, err := executeWatchCommand("stop"); err != nil || output != "" {
 		t.Fatalf("watch stop = %q, %v", output, err)
+	}
+	if len(fake.writes) != 2 || fake.unreadCount != 0 {
+		t.Fatalf("writes = %#v, unread count = %d", fake.writes, fake.unreadCount)
+	}
+	for _, write := range fake.writes {
+		if write.state.Watch || write.state.State != attn.StateQuiet || !write.state.Fired {
+			t.Fatalf("unwatched state = %#v", write.state)
+		}
+	}
+}
+
+func TestWatchStopExplicitTargetsContinueAfterErrorsWithoutPicker(t *testing.T) {
+	stubWatchStop(t, nil)
+	watchStopTerminal = func(io.Writer) bool {
+		t.Fatal("explicit watch stop checked for a TTY")
+		return false
+	}
+	watchStopPick = func(string, []string, []string) ([]string, error) {
+		t.Fatal("explicit watch stop opened fzf")
+		return nil, nil
+	}
+	var calls []string
+	watchStopUnwatch = func(target string) error {
+		calls = append(calls, target)
+		if target == "bad" {
+			return errors.New("bad target")
+		}
+		return nil
+	}
+
+	output, err := executeWatchCommand(
+		"stop", "-t", "%1", "-t", "bad", "work:2.0", "%3",
+	)
+	if err == nil || !strings.Contains(err.Error(), "bad target") || output != "" {
+		t.Fatalf("explicit watch stop = %q, %v", output, err)
+	}
+	if !slices.Equal(calls, []string{"%1", "bad", "work:2.0", "%3"}) {
+		t.Fatalf("unwatch calls = %#v", calls)
+	}
+}
+
+func TestWatchStopBareNonTTYRequiresTargets(t *testing.T) {
+	stubWatchStop(t, nil)
+	watchStopTerminal = func(io.Writer) bool { return false }
+	_, err := executeWatchCommand("stop")
+	if err == nil || !strings.Contains(err.Error(), "pass -t <target> or positional targets") {
+		t.Fatalf("non-TTY watch stop error = %v", err)
+	}
+}
+
+func TestWatchStopPickerCancelIsCleanNoop(t *testing.T) {
+	state := inboxState("%1", "work:1.0", attn.StateActive, true, 100, "build", "agent")
+	stubWatchStop(t, []attn.PaneState{state})
+	watchStopPick = func(string, []string, []string) ([]string, error) {
+		return nil, ErrCancelled
+	}
+	if output, err := executeWatchCommand("stop"); err != nil || output != "" {
+		t.Fatalf("cancelled watch stop = %q, %v", output, err)
 	}
 }
 
@@ -177,6 +266,21 @@ func stubWatchList(t *testing.T, states []attn.PaneState) {
 		return append([]attn.PaneState(nil), states...), nil
 	}
 	watchListNow = func() time.Time { return time.Unix(1000, 0) }
+}
+
+func stubWatchStop(t *testing.T, states []attn.PaneState) {
+	t.Helper()
+	originalList, originalNow := listWatchPanes, watchListNow
+	originalPick, originalTerminal, originalUnwatch := watchStopPick, watchStopTerminal, watchStopUnwatch
+	t.Cleanup(func() {
+		listWatchPanes, watchListNow = originalList, originalNow
+		watchStopPick, watchStopTerminal, watchStopUnwatch = originalPick, originalTerminal, originalUnwatch
+	})
+	listWatchPanes = func() ([]attn.PaneState, error) {
+		return append([]attn.PaneState(nil), states...), nil
+	}
+	watchListNow = func() time.Time { return time.Unix(1000, 0) }
+	watchStopTerminal = func(io.Writer) bool { return true }
 }
 
 func TestWatchReapUsesConfiguredTTLAndFlagOverride(t *testing.T) {

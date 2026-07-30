@@ -16,6 +16,7 @@ import (
 	"tmx/internal/attn"
 	"tmx/internal/config"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 )
 
@@ -33,6 +34,14 @@ var (
 	reapWatchPanes    = attn.ReapPanes
 	watchListNow      = time.Now
 	watchReapNow      = time.Now
+	watchStopPick     = runFzfMulti
+	watchStopTerminal = func(w io.Writer) bool {
+		file, ok := w.(*os.File)
+		return ok && term.IsTerminal(file.Fd())
+	}
+	watchStopUnwatch = func(target string) error {
+		return mutateAttentionTarget(target, mutationUnwatch)
+	}
 )
 
 type watchListEntry struct {
@@ -80,23 +89,7 @@ func newWatchCommand() *cobra.Command {
 				return nil
 			},
 		},
-		&cobra.Command{
-			Use:   "stop",
-			Short: "Stop the detached watcher for this tmux socket",
-			Args:  cobra.NoArgs,
-			RunE: func(cmd *cobra.Command, args []string) error {
-				_, stopped, err := stopWatchDaemon()
-				if err != nil {
-					return err
-				}
-				if stopped {
-					_, err = fmt.Fprintln(cmd.OutOrStdout(), "watcher stopped")
-				} else {
-					_, err = fmt.Fprintln(cmd.OutOrStdout(), "watcher not running")
-				}
-				return err
-			},
-		},
+		newWatchStopCommand(),
 		&cobra.Command{
 			Use:   "status",
 			Short: "Report whether the watcher is running",
@@ -141,6 +134,96 @@ func newWatchCommand() *cobra.Command {
 		newWatchReapCommand(),
 	)
 	return watch
+}
+
+func newWatchStopCommand() *cobra.Command {
+	stop := &cobra.Command{
+		Use:   "stop [target...]",
+		Short: "Stop watching one or more agent panes",
+		Args:  cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			flagTargets, _ := cmd.Flags().GetStringArray("target")
+			targets := append(flagTargets, args...)
+			daemon, _ := cmd.Flags().GetBool("daemon")
+			if daemon {
+				if len(targets) > 0 {
+					return fmt.Errorf("--daemon cannot be combined with pane targets")
+				}
+				_, stopped, err := stopWatchDaemon()
+				if err != nil {
+					return err
+				}
+				if stopped {
+					_, err = fmt.Fprintln(cmd.OutOrStdout(), "watcher stopped")
+				} else {
+					_, err = fmt.Fprintln(cmd.OutOrStdout(), "watcher not running")
+				}
+				return err
+			}
+			if len(targets) > 0 {
+				return unwatchTargets(targets)
+			}
+			if !watchStopTerminal(cmd.OutOrStdout()) {
+				return fmt.Errorf("watch stop needs a TTY to choose panes; pass -t <target> or positional targets")
+			}
+
+			states, err := listWatchPanes()
+			if err != nil {
+				return err
+			}
+			states = watchedWatchStopStates(states)
+			sortInboxStates(states)
+			if len(states) == 0 {
+				_, err = fmt.Fprintln(cmd.OutOrStdout(), emptyInboxMessage)
+				return err
+			}
+
+			lines := make([]string, 0, len(states))
+			for _, state := range states {
+				lines = append(lines, formatInboxPickerLine(makeInboxEntry(state, watchListNow())))
+			}
+			selected, err := watchStopPick(
+				"watch stop > ",
+				lines,
+				append(paneFzfArgs(), "-m"),
+			)
+			if errors.Is(err, ErrCancelled) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			return unwatchTargets(selected)
+		},
+	}
+	stop.Flags().StringArrayP("target", "t", nil, "Target pane, window, or session (repeatable)")
+	stop.Flags().Bool("daemon", false, "Stop the detached watcher daemon")
+	return stop
+}
+
+func watchedWatchStopStates(states []attn.PaneState) []attn.PaneState {
+	watched := make([]attn.PaneState, 0, len(states))
+	for _, state := range states {
+		if state.Watch {
+			watched = append(watched, state)
+		}
+	}
+	return watched
+}
+
+func unwatchTargets(targets []string) error {
+	var errs []error
+	for _, target := range targets {
+		target = strings.TrimSpace(target)
+		if target == "" {
+			errs = append(errs, fmt.Errorf("empty watch target"))
+			continue
+		}
+		if err := watchStopUnwatch(target); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func newWatchListCommand() *cobra.Command {

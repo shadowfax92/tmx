@@ -70,7 +70,9 @@ tmx unwatch         # opt the current pane out until its agent process changes
 
 tmx watch start       # start this tmux server's detached attention watcher
 tmx watch status
-tmx watch stop
+tmx watch stop        # pick watched panes to unwatch (Tab selects several)
+tmx watch stop -t %3 work:2.0  # unwatch explicit targets without fzf
+tmx watch stop --daemon        # stop the detached watcher daemon
 tmx watch reap        # interactively remove stale watched panes
 tmx watch reap --dry-run
 
@@ -174,8 +176,11 @@ Visiting an unread pane clears it within one watcher tick; `tmx jump` clears it
 immediately. New screen activity re-arms the episode. `tmx snooze` gives the
 current pane a fresh unread timestamp so it moves to the back of the
 oldest-first queue. `tmx unwatch` is an explicit opt-out; it re-arms when the
-foreground agent process changes. `tmx watch reap` handles abandoned panes
-older than `watch.reap_ttl`, with a dry-run and y/N confirmation.
+foreground agent process changes. `tmx watch stop` applies the same opt-out to
+multiple panes, using an fzf multi-select when no targets are supplied.
+`tmx watch stop --daemon` stops the detached watcher process. `tmx watch reap`
+handles abandoned panes older than `watch.reap_ttl`, with a dry-run and y/N
+confirmation.
 
 Run the watcher on every server start alongside the key initialization:
 
