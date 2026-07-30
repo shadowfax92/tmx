@@ -290,14 +290,18 @@ func ListPanesFormat(format string) (string, error) {
 	return run("list-panes", "-a", "-F", format)
 }
 
-// CapturePane returns the visible contents of target with escape sequences
-// preserved. Attention callers strip ANSI before hashing; keeping the raw
-// whitespace here avoids turning terminal-only changes into false matches.
-func CapturePane(target string) (string, error) {
-	cmd := exec.Command("tmux", "capture-pane", "-p", "-e", "-t", target)
+// CapturePane returns target's visible contents plus historyLines of scrollback
+// with escape sequences preserved. Attention callers strip ANSI and retain
+// only their configured tail before hashing.
+func CapturePane(target string, historyLines int) (string, error) {
+	args := []string{"capture-pane", "-p", "-e", "-J", "-t", target}
+	if historyLines > 0 {
+		args = append(args, "-S", fmt.Sprintf("-%d", historyLines))
+	}
+	cmd := exec.Command("tmux", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("tmux capture-pane -p -e -t %s: %s (%w)", target, strings.TrimSpace(string(out)), err)
+		return "", fmt.Errorf("tmux %s: %s (%w)", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
 	}
 	return strings.TrimSuffix(string(out), "\n"), nil
 }

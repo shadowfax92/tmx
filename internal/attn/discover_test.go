@@ -38,6 +38,23 @@ func TestDiscoverFindsAgentProcessTreesAcrossSessions(t *testing.T) {
 	}
 }
 
+func TestDiscoverPersistsMatchingAgentProcessIdentity(t *testing.T) {
+	stubDiscovery(t, []tmux.PaneInfo{
+		{ID: "%1", Session: "work", PID: 100, Command: "claude"},
+	}, snapshot(
+		process(100, 1, "/bin/zsh"),
+		process(101, 100, "/opt/bin/claude"),
+	))
+
+	got, err := DiscoverWithFingerprints([]string{"claude"})
+	if err != nil {
+		t.Fatalf("DiscoverWithFingerprints() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "%1" || got[0].ProcessFingerprint != "101:claude" {
+		t.Fatalf("discovered panes = %#v, want %%1 fingerprint 101:claude", got)
+	}
+}
+
 func TestDiscoverExcludesScratchAndFIPBufferPanes(t *testing.T) {
 	stubDiscovery(t, []tmux.PaneInfo{
 		{ID: "%1", Session: "gs/sh/1", PID: 100},

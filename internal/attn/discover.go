@@ -25,10 +25,32 @@ type processSnapshot struct {
 	children map[int][]int
 }
 
+// DiscoveredPane carries the agent process identity that made a pane match.
+// The instance fingerprint lets an explicitly unwatched pane re-arm even when
+// one claude/codex process is replaced by another with the same command name.
+type DiscoveredPane struct {
+	tmux.PaneInfo
+	ProcessFingerprint string
+}
+
 // Discover returns live agent panes from every session on the tmux server.
 // Scratch sessions and focus-in-place buffer panes are excluded before the
 // process tree is inspected.
 func Discover(agents []string) ([]tmux.PaneInfo, error) {
+	discovered, err := DiscoverWithFingerprints(agents)
+	if err != nil {
+		return nil, err
+	}
+	panes := make([]tmux.PaneInfo, 0, len(discovered))
+	for _, pane := range discovered {
+		panes = append(panes, pane.PaneInfo)
+	}
+	return panes, nil
+}
+
+// DiscoverWithFingerprints returns the same inventory as Discover plus the
+// matching agent process instance for watcher re-arm decisions.
+func DiscoverWithFingerprints(agents []string) ([]DiscoveredPane, error) {
 	agentNames := normalizedAgentNames(agents)
 	if len(agentNames) == 0 {
 		return nil, nil
@@ -55,10 +77,13 @@ func Discover(agents []string) ([]tmux.PaneInfo, error) {
 		return nil, err
 	}
 
-	discovered := make([]tmux.PaneInfo, 0, len(candidates))
+	discovered := make([]DiscoveredPane, 0, len(candidates))
 	for _, pane := range candidates {
-		if processes.matchesTree(pane.PID, agentNames) {
-			discovered = append(discovered, pane)
+		if pid, command, matches := processes.matchingAgent(pane.PID, agentNames); matches {
+			discovered = append(discovered, DiscoveredPane{
+				PaneInfo:           pane,
+				ProcessFingerprint: fmt.Sprintf("%d:%s", pid, normalizedCommand(command)),
+			})
 		}
 	}
 	return discovered, nil
@@ -81,15 +106,17 @@ func normalizedCommand(command string) string {
 	return strings.ToLower(name)
 }
 
-func (s processSnapshot) matchesTree(rootPID int, agents map[string]struct{}) bool {
+func (s processSnapshot) matchingAgent(rootPID int, agents map[string]struct{}) (int, string, bool) {
 	if _, exists := s.byPID[rootPID]; !exists {
 		// The pane disappeared after list-panes. Normal tmux churn is not an
 		// error and the stale inventory entry can simply be ignored.
-		return false
+		return 0, "", false
 	}
 
 	pending := []int{rootPID}
 	visited := make(map[int]struct{})
+	matchPID := 0
+	matchCommand := ""
 	for len(pending) > 0 {
 		pid := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
@@ -100,11 +127,14 @@ func (s processSnapshot) matchesTree(rootPID int, agents map[string]struct{}) bo
 
 		process := s.byPID[pid]
 		if _, matches := agents[normalizedCommand(process.command)]; matches {
-			return true
+			if matchPID == 0 || pid < matchPID {
+				matchPID = pid
+				matchCommand = process.command
+			}
 		}
 		pending = append(pending, s.children[pid]...)
 	}
-	return false
+	return matchPID, matchCommand, matchPID != 0
 }
 
 func readProcessSnapshot() (processSnapshot, error) {

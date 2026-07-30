@@ -49,7 +49,7 @@ func (o WatchOptions) quietThreshold() time.Duration {
 
 var (
 	watchSnapshot  = Snapshot
-	watchDiscover  = Discover
+	watchDiscover  = DiscoverWithFingerprints
 	watchCapture   = tmux.CapturePane
 	watchFocused   = tmux.FocusedPaneIDs
 	watchSet       = Set
@@ -74,19 +74,26 @@ func NewWatcher(options WatchOptions) (*Watcher, error) {
 // Run polls immediately and then at the configured interval until cancelled
 // or the tmux inventory becomes unavailable.
 func (w *Watcher) Run(ctx context.Context) error {
+	if err := w.Tick(time.Now()); err != nil {
+		return nil
+	}
+	return w.runAfterInitialTick(ctx)
+}
+
+func (w *Watcher) runAfterInitialTick(ctx context.Context) error {
 	ticker := time.NewTicker(w.options.Poll)
 	defer ticker.Stop()
 
 	for {
-		if err := w.Tick(time.Now()); err != nil {
-			// A disappearing tmux server is a normal daemon shutdown. Pane-level
-			// churn is already swallowed inside Tick.
-			return nil
-		}
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if err := w.Tick(time.Now()); err != nil {
+				// A disappearing tmux server is a normal daemon shutdown.
+				// Pane-level churn is already swallowed inside Tick.
+				return nil
+			}
 		}
 	}
 }
@@ -110,7 +117,7 @@ func (w *Watcher) Tick(now time.Time) error {
 	for _, state := range states {
 		byID[state.ID] = state
 	}
-	agents := make(map[string]tmux.PaneInfo, len(discovered))
+	agents := make(map[string]DiscoveredPane, len(discovered))
 	for _, pane := range discovered {
 		agents[pane.ID] = pane
 	}
@@ -126,18 +133,18 @@ func (w *Watcher) Tick(now time.Time) error {
 	}
 
 	for _, pane := range discovered {
-		captured, err := watchCapture(pane.ID)
+		captured, err := watchCapture(pane.ID, w.options.CaptureLines)
 		if err != nil {
 			// The pane may have disappeared between discovery and capture.
 			continue
 		}
 
 		state := byID[pane.ID]
-		state.PaneInfo = pane
+		state.PaneInfo = pane.PaneInfo
 		next, changed := observePane(
 			state,
 			screenHash(captured, w.options.CaptureLines),
-			processFingerprint(pane),
+			pane.ProcessFingerprint,
 			focused[pane.ID],
 			now,
 			w.options.quietThreshold(),
@@ -154,10 +161,6 @@ func (w *Watcher) Tick(now time.Time) error {
 func hasAttentionState(state PaneState) bool {
 	return state.WatchSet || state.State != "" || state.Since != 0 ||
 		state.Hash != "" || state.Proc != "" || state.Fired
-}
-
-func processFingerprint(pane tmux.PaneInfo) string {
-	return strings.TrimSpace(pane.Command)
 }
 
 // observePane is the pure episode state machine. Fired is intentionally
@@ -198,6 +201,11 @@ func observePane(
 		}
 		if next.Proc == "" && process != "" {
 			next.Proc = process
+		}
+		if next.State == StateUnread {
+			next.State = StateQuiet
+			next.Since = nowUnix
+			next.Fired = true
 		}
 		if next.Hash != hash {
 			next.State = StateActive
@@ -364,7 +372,7 @@ func (systemDaemonBackend) Spawn(executable string, args []string, logPath strin
 	if err != nil {
 		return 0, err
 	}
-	defer logFile.Close()
+	defer func() { _ = logFile.Close() }()
 
 	command := exec.Command(executable, args...)
 	command.Stdin = nil
@@ -374,7 +382,12 @@ func (systemDaemonBackend) Spawn(executable string, args []string, logPath strin
 	if err := command.Start(); err != nil {
 		return 0, err
 	}
-	return command.Process.Pid, nil
+	pid := command.Process.Pid
+	if err := command.Process.Release(); err != nil {
+		_ = command.Process.Kill()
+		return 0, err
+	}
+	return pid, nil
 }
 
 func (systemDaemonBackend) Alive(pid int) bool {
@@ -397,6 +410,7 @@ func (systemDaemonBackend) Signal(pid int, signal os.Signal) error {
 type DaemonManager struct {
 	Paths        DaemonPaths
 	backend      daemonBackend
+	startTimeout time.Duration
 	stopTimeout  time.Duration
 	pollInterval time.Duration
 }
@@ -409,6 +423,7 @@ func currentDaemonManager() (*DaemonManager, error) {
 	return &DaemonManager{
 		Paths:        paths,
 		backend:      systemDaemonBackend{},
+		startTimeout: 5 * time.Second,
 		stopTimeout:  5 * time.Second,
 		pollInterval: 50 * time.Millisecond,
 	}, nil
@@ -420,6 +435,9 @@ func (m *DaemonManager) ensureDefaults() {
 	}
 	if m.stopTimeout <= 0 {
 		m.stopTimeout = 5 * time.Second
+	}
+	if m.startTimeout <= 0 {
+		m.startTimeout = 5 * time.Second
 	}
 	if m.pollInterval <= 0 {
 		m.pollInterval = 50 * time.Millisecond
@@ -434,7 +452,7 @@ func (m *DaemonManager) ensureDir() error {
 }
 
 // Start spawns the current executable as "watch run". It is a no-op while the
-// recorded process is alive and replaces stale pidfiles.
+// pidfile is locked by a watcher and replaces stale, unlocked pidfiles.
 func (m *DaemonManager) Start() (DaemonStatus, bool, error) {
 	m.ensureDefaults()
 	if err := m.ensureDir(); err != nil {
@@ -444,7 +462,7 @@ func (m *DaemonManager) Start() (DaemonStatus, bool, error) {
 	var result DaemonStatus
 	var started bool
 	err := m.withLock(func() error {
-		status, err := m.statusUnlocked()
+		status, err := m.statusUnlocked(true)
 		if err != nil {
 			return err
 		}
@@ -461,13 +479,30 @@ func (m *DaemonManager) Start() (DaemonStatus, bool, error) {
 		if err != nil {
 			return fmt.Errorf("starting watcher: %w", err)
 		}
-		if err := writePID(m.Paths.PIDFile, pid); err != nil {
-			_ = m.backend.Signal(pid, syscall.SIGTERM)
-			return err
+
+		deadline := time.Now().Add(m.startTimeout)
+		for {
+			status, err := m.statusUnlocked(false)
+			if err != nil {
+				return err
+			}
+			if status.Running {
+				if status.PID != pid {
+					return fmt.Errorf("watcher pid %d claimed the socket while starting pid %d", status.PID, pid)
+				}
+				result = status
+				started = true
+				return nil
+			}
+			if !m.backend.Alive(pid) {
+				return fmt.Errorf("watcher exited before becoming ready; see %s", m.Paths.LogFile)
+			}
+			if !time.Now().Before(deadline) {
+				_ = m.backend.Signal(pid, syscall.SIGTERM)
+				return fmt.Errorf("watcher pid %d did not become ready within %s; see %s", pid, m.startTimeout, m.Paths.LogFile)
+			}
+			time.Sleep(m.pollInterval)
 		}
-		result = DaemonStatus{Running: true, PID: pid}
-		started = true
-		return nil
 	})
 	return result, started, err
 }
@@ -481,23 +516,38 @@ func (m *DaemonManager) Status() (DaemonStatus, error) {
 	var status DaemonStatus
 	err := m.withLock(func() error {
 		var err error
-		status, err = m.statusUnlocked()
+		status, err = m.statusUnlocked(true)
 		return err
 	})
 	return status, err
 }
 
-func (m *DaemonManager) statusUnlocked() (DaemonStatus, error) {
-	pid, err := readPID(m.Paths.PIDFile)
+func (m *DaemonManager) statusUnlocked(removeStale bool) (DaemonStatus, error) {
+	pidFile, err := os.OpenFile(m.Paths.PIDFile, os.O_RDWR, 0600)
 	if errors.Is(err, os.ErrNotExist) {
 		return DaemonStatus{}, nil
 	}
 	if err != nil {
-		_ = os.Remove(m.Paths.PIDFile)
+		return DaemonStatus{}, err
+	}
+	defer func() { _ = pidFile.Close() }()
+
+	err = syscall.Flock(int(pidFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		if removeStale && sameFileAtPath(pidFile, m.Paths.PIDFile) {
+			_ = os.Remove(m.Paths.PIDFile)
+		}
+		_ = syscall.Flock(int(pidFile.Fd()), syscall.LOCK_UN)
 		return DaemonStatus{}, nil
 	}
-	if !m.backend.Alive(pid) {
-		_ = os.Remove(m.Paths.PIDFile)
+	if !lockWouldBlock(err) {
+		return DaemonStatus{}, err
+	}
+
+	pid, err := readPIDFile(pidFile)
+	if err != nil {
+		// A watcher holds the file lock but has not marked its first tick
+		// ready yet.
 		return DaemonStatus{}, nil
 	}
 	return DaemonStatus{Running: true, PID: pid}, nil
@@ -514,12 +564,18 @@ func (m *DaemonManager) Stop() (DaemonStatus, bool, error) {
 	var status DaemonStatus
 	err := m.withLock(func() error {
 		var err error
-		status, err = m.statusUnlocked()
+		status, err = m.statusUnlocked(true)
 		if err != nil || !status.Running {
 			return err
 		}
-		if err := m.backend.Signal(status.PID, syscall.SIGTERM); err != nil && m.backend.Alive(status.PID) {
-			return err
+		if signalErr := m.backend.Signal(status.PID, syscall.SIGTERM); signalErr != nil {
+			current, currentErr := m.statusUnlocked(true)
+			if currentErr != nil {
+				return errors.Join(signalErr, currentErr)
+			}
+			if current.Running && current.PID == status.PID {
+				return signalErr
+			}
 		}
 		return nil
 	})
@@ -528,18 +584,22 @@ func (m *DaemonManager) Stop() (DaemonStatus, bool, error) {
 	}
 
 	deadline := time.Now().Add(m.stopTimeout)
-	for m.backend.Alive(status.PID) && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) {
+		current, statusErr := m.Status()
+		if statusErr != nil {
+			return status, false, statusErr
+		}
+		if !current.Running || current.PID != status.PID {
+			return DaemonStatus{}, true, nil
+		}
 		time.Sleep(m.pollInterval)
 	}
-	if m.backend.Alive(status.PID) {
-		return status, false, fmt.Errorf("watcher pid %d did not stop within %s", status.PID, m.stopTimeout)
-	}
-	_ = removePIDIfMatches(m.Paths.PIDFile, status.PID)
-	return DaemonStatus{}, true, nil
+	return status, false, fmt.Errorf("watcher pid %d did not stop within %s", status.PID, m.stopTimeout)
 }
 
-// RunForeground claims the pidfile for this process, executes the polling
-// loop, and removes the claim on exit.
+// RunForeground holds the pidfile lock for the process lifetime. It writes the
+// PID only after the first successful inventory tick, which is the detached
+// start command's readiness handshake.
 func (m *DaemonManager) RunForeground(ctx context.Context, options WatchOptions) error {
 	m.ensureDefaults()
 	if err := m.ensureDir(); err != nil {
@@ -550,23 +610,21 @@ func (m *DaemonManager) RunForeground(ctx context.Context, options WatchOptions)
 		return err
 	}
 
-	pid := m.backend.CurrentPID()
-	err = m.withLock(func() error {
-		status, err := m.statusUnlocked()
-		if err != nil {
-			return err
-		}
-		if status.Running && status.PID != pid {
-			return fmt.Errorf("watcher already running (pid %d)", status.PID)
-		}
-		return writePID(m.Paths.PIDFile, pid)
-	})
+	guard, err := acquirePIDGuard(m.Paths.PIDFile, m.backend.CurrentPID(), m.startTimeout, m.pollInterval)
 	if err != nil {
 		return err
 	}
-	defer removePIDIfMatches(m.Paths.PIDFile, pid) //nolint:errcheck
+	defer func() { _ = guard.Close() }()
 
-	return watcher.Run(ctx)
+	if err := watcher.Tick(time.Now()); err != nil {
+		// No server (or a server shutting down) is a normal foreground exit,
+		// but the pidfile never becomes ready.
+		return nil
+	}
+	if err := guard.MarkReady(); err != nil {
+		return err
+	}
+	return watcher.runAfterInitialTick(ctx)
 }
 
 func (m *DaemonManager) withLock(operation func() error) error {
@@ -575,7 +633,7 @@ func (m *DaemonManager) withLock(operation func() error) error {
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
@@ -583,42 +641,121 @@ func (m *DaemonManager) withLock(operation func() error) error {
 	return operation()
 }
 
-func readPID(path string) (int, error) {
-	data, err := os.ReadFile(path)
+func readPIDFile(file *os.File) (int, error) {
+	if _, err := file.Seek(0, 0); err != nil {
+		return 0, err
+	}
+	data := make([]byte, 64)
+	n, err := file.Read(data)
 	if err != nil {
 		return 0, err
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data[:n])))
 	if err != nil || pid <= 0 {
-		return 0, fmt.Errorf("invalid watcher pidfile %s", path)
+		return 0, errors.New("invalid watcher pidfile")
 	}
 	return pid, nil
 }
 
 func writePID(path string, pid int) error {
-	temporary := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
-	if err := os.WriteFile(temporary, []byte(strconv.Itoa(pid)+"\n"), 0600); err != nil {
-		return err
-	}
-	if err := os.Rename(temporary, path); err != nil {
-		_ = os.Remove(temporary)
-		return err
-	}
-	return nil
+	return os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0600)
 }
 
-func removePIDIfMatches(path string, pid int) error {
-	recorded, err := readPID(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+type pidGuard struct {
+	file *os.File
+	path string
+	pid  int
+}
+
+func acquirePIDGuard(path string, pid int, timeout, poll time.Duration) (*pidGuard, error) {
+	deadline := time.Now().Add(timeout)
+	observedOwner := 0
+	ownerObservations := 0
+	for {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, err
+		}
+		err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			if !sameFileAtPath(file, path) {
+				_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+				_ = file.Close()
+				continue
+			}
+			if err := file.Truncate(0); err != nil {
+				_ = file.Close()
+				return nil, err
+			}
+			return &pidGuard{file: file, path: path, pid: pid}, nil
+		}
+		if !lockWouldBlock(err) {
+			_ = file.Close()
+			return nil, err
+		}
+		owner, ownerErr := readPIDFile(file)
+		_ = file.Close()
+		if ownerErr == nil {
+			if owner == observedOwner {
+				ownerObservations++
+			} else {
+				observedOwner = owner
+				ownerObservations = 1
+			}
+			// Lifecycle commands briefly lock stale pidfiles while inspecting
+			// them. Require the same locked owner twice before treating it as
+			// the long-held daemon lock.
+			if ownerObservations >= 2 {
+				return nil, fmt.Errorf("watcher already running (pid %d)", owner)
+			}
+		} else {
+			observedOwner = 0
+			ownerObservations = 0
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("watcher pidfile remained locked without a ready owner")
+		}
+		time.Sleep(poll)
 	}
-	if err != nil {
+}
+
+func (g *pidGuard) MarkReady() error {
+	if err := g.file.Truncate(0); err != nil {
 		return err
 	}
-	if recorded == pid {
-		return os.Remove(path)
+	if _, err := g.file.Seek(0, 0); err != nil {
+		return err
 	}
-	return nil
+	if _, err := fmt.Fprintf(g.file, "%d\n", g.pid); err != nil {
+		return err
+	}
+	return g.file.Sync()
+}
+
+func (g *pidGuard) Close() error {
+	var errs []error
+	if sameFileAtPath(g.file, g.path) {
+		if err := os.Remove(g.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	if err := syscall.Flock(int(g.file.Fd()), syscall.LOCK_UN); err != nil {
+		errs = append(errs, err)
+	}
+	if err := g.file.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+func lockWouldBlock(err error) bool {
+	return errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)
+}
+
+func sameFileAtPath(file *os.File, path string) bool {
+	opened, openedErr := file.Stat()
+	current, currentErr := os.Stat(path)
+	return openedErr == nil && currentErr == nil && os.SameFile(opened, current)
 }
 
 func StartDaemon() (DaemonStatus, bool, error) {

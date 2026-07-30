@@ -63,11 +63,11 @@ func newWatchCommand() *cobra.Command {
 					return err
 				}
 				if stopped {
-					fmt.Fprintln(cmd.OutOrStdout(), "watcher stopped")
+					_, err = fmt.Fprintln(cmd.OutOrStdout(), "watcher stopped")
 				} else {
-					fmt.Fprintln(cmd.OutOrStdout(), "watcher not running")
+					_, err = fmt.Fprintln(cmd.OutOrStdout(), "watcher not running")
 				}
-				return nil
+				return err
 			},
 		},
 		&cobra.Command{

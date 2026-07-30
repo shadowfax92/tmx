@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -106,6 +108,24 @@ func TestObservePaneUnwatchedNeverFlagsAndProcessChangeRearms(t *testing.T) {
 	}
 }
 
+func TestObservePaneUnwatchedConsumesExistingUnreadFlag(t *testing.T) {
+	state := PaneState{
+		Watch:    false,
+		WatchSet: true,
+		State:    StateUnread,
+		Since:    100,
+		Hash:     "screen",
+		Proc:     "101:claude",
+		Fired:    true,
+	}
+
+	state, changed := observePane(state, "screen", "101:claude", false, unixTime(200), 90*time.Second)
+	assertWatchState(t, state, changed, StateQuiet, true, true)
+	if state.Watch {
+		t.Fatal("unwatched unread pane was re-armed")
+	}
+}
+
 func TestWatcherTickClearsExitedAgentsReadsFocusedPaneAndInitializesNewPane(t *testing.T) {
 	options := WatchOptions{
 		Poll:         time.Second,
@@ -128,12 +148,12 @@ func TestWatcherTickClearsExitedAgentsReadsFocusedPaneAndInitializesNewPane(t *t
 		{
 			PaneInfo: tmux.PaneInfo{ID: "%focus", Command: "claude"},
 			Watch:    true, WatchSet: true, State: StateUnread, Since: 20,
-			Hash: screenHash("same", options.CaptureLines), Proc: "claude", Fired: true,
+			Hash: screenHash("same", options.CaptureLines), Proc: "101:claude", Fired: true,
 		},
 	}
-	discovered := []tmux.PaneInfo{
-		{ID: "%focus", Command: "claude"},
-		{ID: "%new", Command: "claude"},
+	discovered := []DiscoveredPane{
+		{PaneInfo: tmux.PaneInfo{ID: "%focus", Command: "claude"}, ProcessFingerprint: "101:claude"},
+		{PaneInfo: tmux.PaneInfo{ID: "%new", Command: "claude"}, ProcessFingerprint: "102:claude"},
 	}
 
 	var cleared []string
@@ -141,9 +161,9 @@ func TestWatcherTickClearsExitedAgentsReadsFocusedPaneAndInitializesNewPane(t *t
 	reconciled := 0
 	stubWatchBoundary(t, watchBoundaryStub{
 		snapshot: func() ([]PaneState, error) { return states, nil },
-		discover: func([]string) ([]tmux.PaneInfo, error) { return discovered, nil },
+		discover: func([]string) ([]DiscoveredPane, error) { return discovered, nil },
 		focused:  func() (map[string]bool, error) { return map[string]bool{"%focus": true}, nil },
-		capture: func(target string) (string, error) {
+		capture: func(target string, _ int) (string, error) {
 			if target == "%focus" {
 				return "same", nil
 			}
@@ -191,10 +211,14 @@ func TestWatcherTickSkipsPaneThatVanishesDuringCapture(t *testing.T) {
 
 	setCalls := 0
 	stubWatchBoundary(t, watchBoundaryStub{
-		snapshot:  func() ([]PaneState, error) { return nil, nil },
-		discover:  func([]string) ([]tmux.PaneInfo, error) { return []tmux.PaneInfo{{ID: "%gone", Command: "claude"}}, nil },
+		snapshot: func() ([]PaneState, error) { return nil, nil },
+		discover: func([]string) ([]DiscoveredPane, error) {
+			return []DiscoveredPane{{
+				PaneInfo: tmux.PaneInfo{ID: "%gone", Command: "claude"}, ProcessFingerprint: "101:claude",
+			}}, nil
+		},
 		focused:   func() (map[string]bool, error) { return map[string]bool{}, nil },
-		capture:   func(string) (string, error) { return "", errors.New("pane vanished") },
+		capture:   func(string, int) (string, error) { return "", errors.New("pane vanished") },
 		set:       func(string, PaneState) error { setCalls++; return nil },
 		clear:     func(string) error { return nil },
 		reconcile: func() error { return nil },
@@ -221,6 +245,7 @@ func TestDaemonStartNoopStaleReplacementStopAndStatus(t *testing.T) {
 		},
 		backend: backend, stopTimeout: 10 * time.Millisecond, pollInterval: time.Millisecond,
 	}
+	backend.pidFile = manager.Paths.PIDFile
 
 	status, started, err := manager.Start()
 	if err != nil || !started || status.PID != 41 {
@@ -238,7 +263,7 @@ func TestDaemonStartNoopStaleReplacementStopAndStatus(t *testing.T) {
 		t.Fatalf("second Start() = (%+v, %v, %v), spawn calls %d; want no-op", status, started, err, backend.spawnCalls)
 	}
 
-	backend.alive[41] = false
+	backend.release(41)
 	status, started, err = manager.Start()
 	if err != nil || !started || status.PID != 42 || backend.spawnCalls != 2 {
 		t.Fatalf("stale Start() = (%+v, %v, %v), spawn calls %d; want replacement", status, started, err, backend.spawnCalls)
@@ -266,13 +291,14 @@ func TestDaemonStartNoopStaleReplacementStopAndStatus(t *testing.T) {
 	}
 }
 
-func TestDaemonStatusRemovesMalformedAndDeadPidfiles(t *testing.T) {
+func TestDaemonStatusRemovesMalformedAndUnownedPidfiles(t *testing.T) {
 	dir := t.TempDir()
+	backend := &fakeDaemonBackend{alive: map[int]bool{99: true}}
 	manager := &DaemonManager{
 		Paths: DaemonPaths{
 			Dir: dir, PIDFile: filepath.Join(dir, "watch.pid"), LogFile: filepath.Join(dir, "watch.log"),
 		},
-		backend: &fakeDaemonBackend{alive: make(map[int]bool)},
+		backend: backend,
 	}
 
 	if err := os.WriteFile(manager.Paths.PIDFile, []byte("not-a-pid\n"), 0600); err != nil {
@@ -291,10 +317,81 @@ func TestDaemonStatusRemovesMalformedAndDeadPidfiles(t *testing.T) {
 	}
 	status, err = manager.Status()
 	if err != nil || status.Running {
-		t.Fatalf("dead Status() = (%+v, %v), want stopped", status, err)
+		t.Fatalf("unowned Status() = (%+v, %v), want stopped", status, err)
 	}
 	if _, err := os.Stat(manager.Paths.PIDFile); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("dead pidfile was not removed: %v", err)
+		t.Fatalf("unowned pidfile was not removed: %v", err)
+	}
+	if _, stopped, err := manager.Stop(); err != nil || stopped || len(backend.signals) != 0 {
+		t.Fatalf("Stop() on unowned pid = stopped %v, err %v, signals %#v", stopped, err, backend.signals)
+	}
+}
+
+func TestDaemonStartFailsWhenChildExitsBeforeReady(t *testing.T) {
+	dir := t.TempDir()
+	backend := &fakeDaemonBackend{
+		executable:  "/opt/bin/tmx",
+		pids:        []int{55},
+		alive:       make(map[int]bool),
+		exitOnSpawn: true,
+	}
+	manager := &DaemonManager{
+		Paths: DaemonPaths{
+			Dir: dir, PIDFile: filepath.Join(dir, "watch.pid"), LogFile: filepath.Join(dir, "watch.log"),
+		},
+		backend: backend, startTimeout: 10 * time.Millisecond, pollInterval: time.Millisecond,
+	}
+
+	status, started, err := manager.Start()
+	if err == nil || started || status.Running {
+		t.Fatalf("Start() = (%+v, %v, %v), want readiness failure", status, started, err)
+	}
+	if !strings.Contains(err.Error(), "exited before becoming ready") {
+		t.Fatalf("Start() error = %v, want readiness detail", err)
+	}
+}
+
+func TestPIDGuardDistinguishesTransientInspectionFromDaemonOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "watch.pid")
+	if err := writePID(path, 99); err != nil {
+		t.Fatal(err)
+	}
+	inspection, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(inspection.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		time.Sleep(2 * time.Millisecond)
+		_ = syscall.Flock(int(inspection.Fd()), syscall.LOCK_UN)
+		_ = inspection.Close()
+	}()
+
+	guard, err := acquirePIDGuard(path, 77, 100*time.Millisecond, 5*time.Millisecond)
+	if err != nil {
+		t.Fatalf("acquirePIDGuard() after transient inspection error = %v", err)
+	}
+	if err := guard.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	if err := guard.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	owner, err := acquirePIDGuard(path, 88, 100*time.Millisecond, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = owner.Close() }()
+
+	if _, err := acquirePIDGuard(path, 89, 20*time.Millisecond, time.Millisecond); err == nil ||
+		!strings.Contains(err.Error(), "already running (pid 88)") {
+		t.Fatalf("second acquirePIDGuard() error = %v, want existing daemon", err)
 	}
 }
 
@@ -336,8 +433,8 @@ func assertWatchState(
 
 type watchBoundaryStub struct {
 	snapshot  func() ([]PaneState, error)
-	discover  func([]string) ([]tmux.PaneInfo, error)
-	capture   func(string) (string, error)
+	discover  func([]string) ([]DiscoveredPane, error)
+	capture   func(string, int) (string, error)
 	focused   func() (map[string]bool, error)
 	set       func(string, PaneState) error
 	clear     func(string) error
@@ -372,6 +469,9 @@ type fakeDaemonBackend struct {
 	signals        []int
 	spawnCalls     int
 	currentPID     int
+	pidFile        string
+	guards         map[int]*pidGuard
+	exitOnSpawn    bool
 }
 
 func (f *fakeDaemonBackend) CurrentExecutable() (string, error) {
@@ -389,6 +489,24 @@ func (f *fakeDaemonBackend) Spawn(executable string, args []string, logPath stri
 	pid := f.pids[f.spawnCalls]
 	f.spawnCalls++
 	f.alive[pid] = true
+	if f.exitOnSpawn {
+		f.alive[pid] = false
+		return pid, nil
+	}
+	if f.pidFile != "" {
+		guard, err := acquirePIDGuard(f.pidFile, pid, time.Second, time.Millisecond)
+		if err != nil {
+			return 0, err
+		}
+		if err := guard.MarkReady(); err != nil {
+			_ = guard.Close()
+			return 0, err
+		}
+		if f.guards == nil {
+			f.guards = make(map[int]*pidGuard)
+		}
+		f.guards[pid] = guard
+	}
 	return pid, nil
 }
 
@@ -398,8 +516,16 @@ func (f *fakeDaemonBackend) Alive(pid int) bool {
 
 func (f *fakeDaemonBackend) Signal(pid int, _ os.Signal) error {
 	f.signals = append(f.signals, pid)
-	f.alive[pid] = false
+	f.release(pid)
 	return nil
+}
+
+func (f *fakeDaemonBackend) release(pid int) {
+	f.alive[pid] = false
+	if guard := f.guards[pid]; guard != nil {
+		_ = guard.Close()
+		delete(f.guards, pid)
+	}
 }
 
 var _ daemonBackend = (*fakeDaemonBackend)(nil)
