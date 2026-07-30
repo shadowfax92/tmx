@@ -1,0 +1,405 @@
+package attn
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+	"time"
+
+	"tmx/internal/tmux"
+)
+
+func TestScreenHashStripsANSIAndUsesOnlyTrailingLines(t *testing.T) {
+	colored := "ignored\nalso ignored\n\u001b[31mkeep\u001b[0m\nlast"
+	plain := "different\nprefix\nkeep\nlast"
+
+	if got, want := screenHash(colored, 2), screenHash(plain, 2); got != want {
+		t.Fatalf("trailing ANSI-stripped hashes differ: %q != %q", got, want)
+	}
+	if got, want := screenHash("one\nkeep\nchanged", 2), screenHash(plain, 2); got == want {
+		t.Fatalf("material trailing-line change did not change hash: %q", got)
+	}
+}
+
+func TestObservePaneFlagsExactlyOncePerQuietEpisodeAndRearmsOnChange(t *testing.T) {
+	quietFor := 90 * time.Second
+	state, changed := observePane(PaneState{}, "screen-a", "claude", false, unixTime(100), quietFor)
+	assertWatchState(t, state, changed, StateActive, true, false)
+
+	state, changed = observePane(state, "screen-a", "claude", false, unixTime(101), quietFor)
+	assertWatchState(t, state, changed, StateQuiet, true, false)
+
+	state, changed = observePane(state, "screen-a", "claude", false, unixTime(189), quietFor)
+	assertWatchState(t, state, changed, StateQuiet, false, false)
+
+	state, changed = observePane(state, "screen-a", "claude", false, unixTime(190), quietFor)
+	assertWatchState(t, state, changed, StateUnread, true, true)
+	flaggedAt := state.Since
+
+	state, changed = observePane(state, "screen-a", "claude", false, unixTime(300), quietFor)
+	assertWatchState(t, state, changed, StateUnread, false, true)
+	if state.Since != flaggedAt {
+		t.Fatalf("unchanged unread episode timestamp = %d, want %d", state.Since, flaggedAt)
+	}
+
+	state, changed = observePane(state, "screen-a", "claude", true, unixTime(301), quietFor)
+	assertWatchState(t, state, changed, StateQuiet, true, true)
+
+	state, changed = observePane(state, "screen-a", "claude", false, unixTime(500), quietFor)
+	assertWatchState(t, state, changed, StateQuiet, false, true)
+
+	state, changed = observePane(state, "screen-b", "claude", false, unixTime(501), quietFor)
+	assertWatchState(t, state, changed, StateActive, true, false)
+
+	state, changed = observePane(state, "screen-b", "claude", false, unixTime(502), quietFor)
+	assertWatchState(t, state, changed, StateQuiet, true, false)
+
+	state, changed = observePane(state, "screen-b", "claude", false, unixTime(591), quietFor)
+	assertWatchState(t, state, changed, StateUnread, true, true)
+}
+
+func TestObservePaneConsumesQuietEpisodeWhenAlreadyFocused(t *testing.T) {
+	state := PaneState{
+		Watch:    true,
+		WatchSet: true,
+		State:    StateQuiet,
+		Since:    100,
+		Hash:     "screen",
+		Proc:     "claude",
+	}
+
+	state, changed := observePane(state, "screen", "claude", true, unixTime(190), 90*time.Second)
+	assertWatchState(t, state, changed, StateQuiet, true, true)
+
+	state, changed = observePane(state, "screen", "claude", false, unixTime(400), 90*time.Second)
+	assertWatchState(t, state, changed, StateQuiet, false, true)
+}
+
+func TestObservePaneUnwatchedNeverFlagsAndProcessChangeRearms(t *testing.T) {
+	state := PaneState{
+		Watch:    false,
+		WatchSet: true,
+		State:    StateActive,
+		Since:    100,
+		Hash:     "screen-a",
+		Proc:     "claude",
+	}
+
+	state, changed := observePane(state, "screen-a", "claude", false, unixTime(500), 90*time.Second)
+	assertWatchState(t, state, changed, StateActive, false, false)
+	if state.Watch {
+		t.Fatal("unchanged opted-out pane re-armed")
+	}
+
+	state, changed = observePane(state, "screen-b", "claude", false, unixTime(501), 90*time.Second)
+	assertWatchState(t, state, changed, StateActive, true, false)
+	if state.Watch {
+		t.Fatal("screen activity alone re-armed opted-out pane")
+	}
+
+	state, changed = observePane(state, "screen-b", "codex", false, unixTime(502), 90*time.Second)
+	assertWatchState(t, state, changed, StateActive, true, false)
+	if !state.Watch || state.Proc != "codex" {
+		t.Fatalf("process change state = %#v, want watched codex", state)
+	}
+}
+
+func TestWatcherTickClearsExitedAgentsReadsFocusedPaneAndInitializesNewPane(t *testing.T) {
+	options := WatchOptions{
+		Poll:         time.Second,
+		GracePeriods: 3,
+		Period:       30 * time.Second,
+		CaptureLines: 30,
+		Agents:       []string{"claude"},
+	}
+	watcher, err := NewWatcher(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	states := []PaneState{
+		{
+			PaneInfo: tmux.PaneInfo{ID: "%old", Command: "zsh"},
+			Watch:    true, WatchSet: true, State: StateUnread, Since: 10,
+			Hash: "old", Proc: "claude", Fired: true,
+		},
+		{
+			PaneInfo: tmux.PaneInfo{ID: "%focus", Command: "claude"},
+			Watch:    true, WatchSet: true, State: StateUnread, Since: 20,
+			Hash: screenHash("same", options.CaptureLines), Proc: "claude", Fired: true,
+		},
+	}
+	discovered := []tmux.PaneInfo{
+		{ID: "%focus", Command: "claude"},
+		{ID: "%new", Command: "claude"},
+	}
+
+	var cleared []string
+	written := make(map[string]PaneState)
+	reconciled := 0
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot: func() ([]PaneState, error) { return states, nil },
+		discover: func([]string) ([]tmux.PaneInfo, error) { return discovered, nil },
+		focused:  func() (map[string]bool, error) { return map[string]bool{"%focus": true}, nil },
+		capture: func(target string) (string, error) {
+			if target == "%focus" {
+				return "same", nil
+			}
+			return "new screen", nil
+		},
+		set: func(target string, state PaneState) error {
+			written[target] = state
+			return nil
+		},
+		clear: func(target string) error {
+			cleared = append(cleared, target)
+			return nil
+		},
+		reconcile: func() error {
+			reconciled++
+			return nil
+		},
+	})
+
+	if err := watcher.Tick(unixTime(100)); err != nil {
+		t.Fatalf("Tick() error = %v", err)
+	}
+	if !slices.Equal(cleared, []string{"%old"}) {
+		t.Fatalf("cleared panes = %#v, want %%old", cleared)
+	}
+	if got := written["%focus"]; got.State != StateQuiet || !got.Fired {
+		t.Fatalf("focused pane state = %#v, want fired quiet", got)
+	}
+	if got := written["%new"]; got.State != StateActive || !got.Watch || got.Hash == "" {
+		t.Fatalf("new pane state = %#v, want watched active", got)
+	}
+	if reconciled != 1 {
+		t.Fatalf("reconcile calls = %d, want 1", reconciled)
+	}
+}
+
+func TestWatcherTickSkipsPaneThatVanishesDuringCapture(t *testing.T) {
+	watcher, err := NewWatcher(WatchOptions{
+		Poll: time.Second, GracePeriods: 1, Period: time.Second,
+		CaptureLines: 30, Agents: []string{"claude"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	setCalls := 0
+	stubWatchBoundary(t, watchBoundaryStub{
+		snapshot:  func() ([]PaneState, error) { return nil, nil },
+		discover:  func([]string) ([]tmux.PaneInfo, error) { return []tmux.PaneInfo{{ID: "%gone", Command: "claude"}}, nil },
+		focused:   func() (map[string]bool, error) { return map[string]bool{}, nil },
+		capture:   func(string) (string, error) { return "", errors.New("pane vanished") },
+		set:       func(string, PaneState) error { setCalls++; return nil },
+		clear:     func(string) error { return nil },
+		reconcile: func() error { return nil },
+	})
+
+	if err := watcher.Tick(time.Now()); err != nil {
+		t.Fatalf("Tick() pane churn error = %v, want nil", err)
+	}
+	if setCalls != 0 {
+		t.Fatalf("Set calls = %d, want 0", setCalls)
+	}
+}
+
+func TestDaemonStartNoopStaleReplacementStopAndStatus(t *testing.T) {
+	dir := t.TempDir()
+	backend := &fakeDaemonBackend{
+		executable: "/opt/bin/tmx",
+		pids:       []int{41, 42},
+		alive:      make(map[int]bool),
+	}
+	manager := &DaemonManager{
+		Paths: DaemonPaths{
+			Dir: dir, PIDFile: filepath.Join(dir, "watch.pid"), LogFile: filepath.Join(dir, "watch.log"),
+		},
+		backend: backend, stopTimeout: 10 * time.Millisecond, pollInterval: time.Millisecond,
+	}
+
+	status, started, err := manager.Start()
+	if err != nil || !started || status.PID != 41 {
+		t.Fatalf("first Start() = (%+v, %v, %v), want started pid 41", status, started, err)
+	}
+	if backend.executableSeen != "/opt/bin/tmx" || !slices.Equal(backend.argsSeen, []string{"watch", "run"}) {
+		t.Fatalf("spawn = %q %#v, want current executable watch run", backend.executableSeen, backend.argsSeen)
+	}
+	if backend.logSeen != manager.Paths.LogFile {
+		t.Fatalf("spawn log = %q, want %q", backend.logSeen, manager.Paths.LogFile)
+	}
+
+	status, started, err = manager.Start()
+	if err != nil || started || status.PID != 41 || backend.spawnCalls != 1 {
+		t.Fatalf("second Start() = (%+v, %v, %v), spawn calls %d; want no-op", status, started, err, backend.spawnCalls)
+	}
+
+	backend.alive[41] = false
+	status, started, err = manager.Start()
+	if err != nil || !started || status.PID != 42 || backend.spawnCalls != 2 {
+		t.Fatalf("stale Start() = (%+v, %v, %v), spawn calls %d; want replacement", status, started, err, backend.spawnCalls)
+	}
+
+	status, err = manager.Status()
+	if err != nil || !status.Running || status.PID != 42 {
+		t.Fatalf("Status() = (%+v, %v), want running pid 42", status, err)
+	}
+
+	status, stopped, err := manager.Stop()
+	if err != nil || !stopped || status.Running {
+		t.Fatalf("Stop() = (%+v, %v, %v), want stopped", status, stopped, err)
+	}
+	if !slices.Equal(backend.signals, []int{42}) {
+		t.Fatalf("signals = %#v, want [42]", backend.signals)
+	}
+	if _, err := os.Stat(manager.Paths.PIDFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pidfile after stop error = %v, want not exist", err)
+	}
+
+	status, stopped, err = manager.Stop()
+	if err != nil || stopped || status.Running {
+		t.Fatalf("second Stop() = (%+v, %v, %v), want no-op", status, stopped, err)
+	}
+}
+
+func TestDaemonStatusRemovesMalformedAndDeadPidfiles(t *testing.T) {
+	dir := t.TempDir()
+	manager := &DaemonManager{
+		Paths: DaemonPaths{
+			Dir: dir, PIDFile: filepath.Join(dir, "watch.pid"), LogFile: filepath.Join(dir, "watch.log"),
+		},
+		backend: &fakeDaemonBackend{alive: make(map[int]bool)},
+	}
+
+	if err := os.WriteFile(manager.Paths.PIDFile, []byte("not-a-pid\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	status, err := manager.Status()
+	if err != nil || status.Running {
+		t.Fatalf("malformed Status() = (%+v, %v), want stopped", status, err)
+	}
+	if _, err := os.Stat(manager.Paths.PIDFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("malformed pidfile was not removed: %v", err)
+	}
+
+	if err := writePID(manager.Paths.PIDFile, 99); err != nil {
+		t.Fatal(err)
+	}
+	status, err = manager.Status()
+	if err != nil || status.Running {
+		t.Fatalf("dead Status() = (%+v, %v), want stopped", status, err)
+	}
+	if _, err := os.Stat(manager.Paths.PIDFile); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dead pidfile was not removed: %v", err)
+	}
+}
+
+func TestCurrentDaemonPathsArePerSocketUnderStateDir(t *testing.T) {
+	t.Setenv("TMX_STATE_DIR", "/state/tmx")
+	t.Setenv("TMUX", "/tmp/tmux-501/dev,123,0")
+
+	paths, err := CurrentDaemonPaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDir := "/state/tmx/%2Ftmp%2Ftmux-501%2Fdev"
+	if paths.Dir != wantDir {
+		t.Fatalf("daemon dir = %q, want %q", paths.Dir, wantDir)
+	}
+	if paths.PIDFile != filepath.Join(wantDir, "watch.pid") || paths.LogFile != filepath.Join(wantDir, "watch.log") {
+		t.Fatalf("daemon paths = %+v", paths)
+	}
+}
+
+func unixTime(seconds int64) time.Time {
+	return time.Unix(seconds, 0)
+}
+
+func assertWatchState(
+	t *testing.T,
+	state PaneState,
+	changed bool,
+	wantState AttentionState,
+	wantChanged bool,
+	wantFired bool,
+) {
+	t.Helper()
+	if state.State != wantState || changed != wantChanged || state.Fired != wantFired {
+		t.Fatalf("state = %s changed=%v fired=%v, want %s changed=%v fired=%v",
+			state.State, changed, state.Fired, wantState, wantChanged, wantFired)
+	}
+}
+
+type watchBoundaryStub struct {
+	snapshot  func() ([]PaneState, error)
+	discover  func([]string) ([]tmux.PaneInfo, error)
+	capture   func(string) (string, error)
+	focused   func() (map[string]bool, error)
+	set       func(string, PaneState) error
+	clear     func(string) error
+	reconcile func() error
+}
+
+func stubWatchBoundary(t *testing.T, stub watchBoundaryStub) {
+	t.Helper()
+	originalSnapshot, originalDiscover := watchSnapshot, watchDiscover
+	originalCapture, originalFocused := watchCapture, watchFocused
+	originalSet, originalClear := watchSet, watchClear
+	originalReconcile := watchReconcile
+	watchSnapshot, watchDiscover = stub.snapshot, stub.discover
+	watchCapture, watchFocused = stub.capture, stub.focused
+	watchSet, watchClear = stub.set, stub.clear
+	watchReconcile = stub.reconcile
+	t.Cleanup(func() {
+		watchSnapshot, watchDiscover = originalSnapshot, originalDiscover
+		watchCapture, watchFocused = originalCapture, originalFocused
+		watchSet, watchClear = originalSet, originalClear
+		watchReconcile = originalReconcile
+	})
+}
+
+type fakeDaemonBackend struct {
+	executable     string
+	executableSeen string
+	argsSeen       []string
+	logSeen        string
+	pids           []int
+	alive          map[int]bool
+	signals        []int
+	spawnCalls     int
+	currentPID     int
+}
+
+func (f *fakeDaemonBackend) CurrentExecutable() (string, error) {
+	return f.executable, nil
+}
+
+func (f *fakeDaemonBackend) CurrentPID() int {
+	return f.currentPID
+}
+
+func (f *fakeDaemonBackend) Spawn(executable string, args []string, logPath string) (int, error) {
+	f.executableSeen = executable
+	f.argsSeen = append([]string(nil), args...)
+	f.logSeen = logPath
+	pid := f.pids[f.spawnCalls]
+	f.spawnCalls++
+	f.alive[pid] = true
+	return pid, nil
+}
+
+func (f *fakeDaemonBackend) Alive(pid int) bool {
+	return f.alive[pid]
+}
+
+func (f *fakeDaemonBackend) Signal(pid int, _ os.Signal) error {
+	f.signals = append(f.signals, pid)
+	f.alive[pid] = false
+	return nil
+}
+
+var _ daemonBackend = (*fakeDaemonBackend)(nil)

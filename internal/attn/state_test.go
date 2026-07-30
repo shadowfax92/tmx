@@ -15,11 +15,11 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() absent state error = %v", err)
 	}
-	if got.Watch || got.WatchSet || got.State != "" || got.Since != 0 || got.Hash != "" {
+	if got.Watch || got.WatchSet || got.State != "" || got.Since != 0 || got.Hash != "" || got.Proc != "" || got.Fired {
 		t.Fatalf("Get() absent state = %#v, want zero values", got)
 	}
 
-	want := PaneState{Watch: true, State: StateUnread, Since: 1234, Hash: "screen-a"}
+	want := PaneState{Watch: true, State: StateUnread, Since: 1234, Hash: "screen-a", Proc: "claude", Fired: true}
 	if err := Set("%1", want); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
@@ -27,7 +27,8 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() error = %v", err)
 	}
-	if got.ID != "%1" || !got.Watch || !got.WatchSet || got.State != StateUnread || got.Since != 1234 || got.Hash != "screen-a" {
+	if got.ID != "%1" || !got.Watch || !got.WatchSet || got.State != StateUnread || got.Since != 1234 ||
+		got.Hash != "screen-a" || got.Proc != "claude" || !got.Fired {
 		t.Fatalf("Get() = %#v, want written contract", got)
 	}
 	if fake.windowCount != 1 {
@@ -61,7 +62,7 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() after Clear error = %v", err)
 	}
-	if got.WatchSet || got.State != "" || got.Since != 0 || got.Hash != "" {
+	if got.WatchSet || got.State != "" || got.Since != 0 || got.Hash != "" || got.Proc != "" || got.Fired {
 		t.Fatalf("Get() after Clear = %#v, want zero values", got)
 	}
 	if fake.windowCount != 0 {
@@ -72,8 +73,8 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	fake := newFakeStateBackend()
 	fake.listOutput = strings.Join([]string{
-		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "review", "claude", "", "/tmp/a", "1", "unread", "42", "hash-a", "_"}, "\t"),
-		strings.Join([]string{"%2", "other:3.1", "other", "3", "shell", "1", "202", "", "zsh", "", "/tmp/b", "", "", "", "", "_"}, "\t"),
+		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "review", "claude", "", "/tmp/a", "1", "unread", "42", "hash-a", "claude", "1", "_"}, "\t"),
+		strings.Join([]string{"%2", "other:3.1", "other", "3", "shell", "1", "202", "", "zsh", "", "/tmp/b", "", "", "", "", "", "", "_"}, "\t"),
 	}, "\n")
 	stubStateBackend(t, fake)
 
@@ -84,7 +85,7 @@ func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	if fake.listCalls != 1 {
 		t.Fatalf("list-panes calls = %d, want 1", fake.listCalls)
 	}
-	for _, option := range []string{"#{@attn_watch}", "#{@attn_state}", "#{@attn_since}", "#{@attn_hash}"} {
+	for _, option := range []string{"#{@attn_watch}", "#{@attn_state}", "#{@attn_since}", "#{@attn_hash}", "#{@attn_proc}", "#{@attn_fired}"} {
 		if !strings.Contains(fake.listFormat, option) {
 			t.Fatalf("snapshot format %q missing %s", fake.listFormat, option)
 		}
@@ -92,11 +93,32 @@ func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("Snapshot() returned %d panes, want 2", len(got))
 	}
-	if got[0].ID != "%1" || !got[0].Watch || got[0].State != StateUnread || got[0].Since != 42 || got[0].Hash != "hash-a" {
+	if got[0].ID != "%1" || !got[0].Watch || got[0].State != StateUnread || got[0].Since != 42 ||
+		got[0].Hash != "hash-a" || got[0].Proc != "claude" || !got[0].Fired {
 		t.Fatalf("watched snapshot = %#v", got[0])
 	}
-	if got[1].ID != "%2" || got[1].WatchSet || got[1].State != "" || got[1].Since != 0 || got[1].Hash != "" {
+	if got[1].ID != "%2" || got[1].WatchSet || got[1].State != "" || got[1].Since != 0 ||
+		got[1].Hash != "" || got[1].Proc != "" || got[1].Fired {
 		t.Fatalf("absent snapshot = %#v, want zero state", got[1])
+	}
+}
+
+func TestReconcileWindowUnreadCountsDropsOrphanedPaneCount(t *testing.T) {
+	fake := newFakeStateBackend()
+	fake.listOutput = strings.Join([]string{
+		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "", "claude", "", "/tmp/a", "1", "quiet", "42", "hash-a", "claude", "1", "_"}, "\t"),
+		strings.Join([]string{"%2", "work:2.0", "work", "2", "other", "0", "202", "", "codex", "", "/tmp/b", "1", "unread", "43", "hash-b", "codex", "1", "_"}, "\t"),
+	}, "\n")
+	stubStateBackend(t, fake)
+
+	if err := ReconcileWindowUnreadCounts(); err != nil {
+		t.Fatalf("ReconcileWindowUnreadCounts() error = %v", err)
+	}
+	if got := fake.windowValues["work:1"]; got != "0" {
+		t.Fatalf("work:1 unread count = %q, want 0 after unread pane disappeared", got)
+	}
+	if got := fake.windowValues["work:2"]; got != "1" {
+		t.Fatalf("work:2 unread count = %q, want 1", got)
 	}
 }
 
@@ -186,12 +208,14 @@ type fakeStateBackend struct {
 	listCalls         int
 	listFormat        string
 	lastDisplayTarget string
+	windowValues      map[string]string
 }
 
 func newFakeStateBackend() *fakeStateBackend {
 	return &fakeStateBackend{
-		options:     make(map[string]map[string]string),
-		resolutions: make(map[string]string),
+		options:      make(map[string]map[string]string),
+		resolutions:  make(map[string]string),
+		windowValues: make(map[string]string),
 	}
 }
 
@@ -200,6 +224,7 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 	originalList, originalDisplay := listPanesFormat, displayPaneFormat
 	originalShow, originalSet := showPaneVar, setPaneVar
 	originalUnset, originalAdjust := unsetPaneVar, adjustWindowVar
+	originalSetWindow := setWindowVar
 	originalLock, originalUnlock := lockState, unlockState
 
 	listPanesFormat = func(format string) (string, error) {
@@ -246,6 +271,12 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 		}
 		return nil
 	}
+	setWindowVar = func(target, _ string, value string) error {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		fake.windowValues[target] = value
+		return nil
+	}
 	lockState = func(_ string) error {
 		fake.stateMu.Lock()
 		return nil
@@ -258,6 +289,7 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 		listPanesFormat, displayPaneFormat = originalList, originalDisplay
 		showPaneVar, setPaneVar = originalShow, originalSet
 		unsetPaneVar, adjustWindowVar = originalUnset, originalAdjust
+		setWindowVar = originalSetWindow
 		lockState, unlockState = originalLock, originalUnlock
 	})
 }

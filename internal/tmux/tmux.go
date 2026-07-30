@@ -290,6 +290,34 @@ func ListPanesFormat(format string) (string, error) {
 	return run("list-panes", "-a", "-F", format)
 }
 
+// CapturePane returns the visible contents of target with escape sequences
+// preserved. Attention callers strip ANSI before hashing; keeping the raw
+// whitespace here avoids turning terminal-only changes into false matches.
+func CapturePane(target string) (string, error) {
+	cmd := exec.Command("tmux", "capture-pane", "-p", "-e", "-t", target)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("tmux capture-pane -p -e -t %s: %s (%w)", target, strings.TrimSpace(string(out)), err)
+	}
+	return strings.TrimSuffix(string(out), "\n"), nil
+}
+
+// FocusedPaneIDs returns every pane selected by an attached client. A pane is
+// considered visited when any client focuses it.
+func FocusedPaneIDs() (map[string]bool, error) {
+	out, err := run("list-clients", "-F", "#{pane_id}")
+	if err != nil {
+		return nil, err
+	}
+	focused := make(map[string]bool)
+	for _, paneID := range strings.Split(out, "\n") {
+		if paneID != "" {
+			focused[paneID] = true
+		}
+	}
+	return focused, nil
+}
+
 func SetCurrentPaneLabel(value string) error {
 	target, err := PaneID()
 	if err != nil {

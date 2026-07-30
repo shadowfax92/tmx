@@ -14,6 +14,8 @@ const (
 	StateOption             = "attn_state"
 	SinceOption             = "attn_since"
 	HashOption              = "attn_hash"
+	ProcOption              = "attn_proc"
+	FiredOption             = "attn_fired"
 	WindowUnreadCountOption = "attn_unread_count"
 )
 
@@ -34,9 +36,11 @@ type PaneState struct {
 	State    AttentionState
 	Since    int64
 	Hash     string
+	Proc     string
+	Fired    bool
 }
 
-const snapshotFormat = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{@fip_buffer}\t#{pane_current_path}\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_hash}\t_"
+const snapshotFormat = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{@fip_buffer}\t#{pane_current_path}\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_hash}\t#{@attn_proc}\t#{@attn_fired}\t_"
 
 var (
 	listPanesFormat   = tmux.ListPanesFormat
@@ -45,12 +49,13 @@ var (
 	setPaneVar        = tmux.SetPaneVar
 	unsetPaneVar      = tmux.UnsetPaneVar
 	adjustWindowVar   = tmux.AdjustWindowVar
+	setWindowVar      = tmux.SetWindowVar
 	lockState         = tmux.WaitForLock
 	unlockState       = tmux.WaitForUnlock
 )
 
 // Snapshot returns attention state alongside the existing pane inventory.
-// All four user options are expanded in one list-panes call.
+// All attention user options are expanded in one list-panes call.
 func Snapshot() ([]PaneState, error) {
 	out, err := listPanesFormat(snapshotFormat)
 	if err != nil {
@@ -62,8 +67,8 @@ func Snapshot() ([]PaneState, error) {
 
 	var states []PaneState
 	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "\t", 16)
-		if len(parts) != 16 {
+		parts := strings.SplitN(line, "\t", 18)
+		if len(parts) != 18 {
 			continue
 		}
 		windowIndex, _ := strconv.Atoi(parts[3])
@@ -89,6 +94,8 @@ func Snapshot() ([]PaneState, error) {
 			State:    AttentionState(parts[12]),
 			Since:    since,
 			Hash:     parts[14],
+			Proc:     parts[15],
+			Fired:    parts[16] == "1",
 		})
 	}
 	return states, nil
@@ -133,8 +140,8 @@ func Get(target string) (PaneState, error) {
 }
 
 func readPaneState(paneID string) (PaneState, error) {
-	values := make([]string, 4)
-	for i, key := range []string{WatchOption, StateOption, SinceOption, HashOption} {
+	values := make([]string, 6)
+	for i, key := range []string{WatchOption, StateOption, SinceOption, HashOption, ProcOption, FiredOption} {
 		value, err := showPaneVar(paneID, key)
 		if err != nil {
 			return PaneState{}, err
@@ -148,6 +155,8 @@ func readPaneState(paneID string) (PaneState, error) {
 		State:    AttentionState(values[1]),
 		Since:    since,
 		Hash:     values[3],
+		Proc:     values[4],
+		Fired:    values[5] == "1",
 	}, nil
 }
 
@@ -171,6 +180,10 @@ func Set(target string, state PaneState) error {
 		if state.Watch {
 			watch = "1"
 		}
+		fired := "0"
+		if state.Fired {
+			fired = "1"
+		}
 		values := []struct {
 			key   string
 			value string
@@ -178,6 +191,8 @@ func Set(target string, state PaneState) error {
 			{WatchOption, watch},
 			{SinceOption, strconv.FormatInt(state.Since, 10)},
 			{HashOption, state.Hash},
+			{ProcOption, state.Proc},
+			{FiredOption, fired},
 			{StateOption, string(state.State)},
 		}
 		for _, value := range values {
@@ -211,7 +226,7 @@ func Clear(target string) error {
 		}
 
 		var errs []error
-		for _, key := range []string{WatchOption, StateOption, SinceOption, HashOption} {
+		for _, key := range []string{WatchOption, StateOption, SinceOption, HashOption, ProcOption, FiredOption} {
 			if err := unsetPaneVar(paneID, key); err != nil {
 				errs = append(errs, err)
 			}
@@ -223,6 +238,48 @@ func Clear(target string) error {
 		}
 		return errors.Join(errs...)
 	})
+}
+
+// ReconcileWindowUnreadCounts repairs window aggregates from the live pane
+// inventory. This is what removes the count left behind when an unread pane
+// dies before its pane options can be cleared.
+func ReconcileWindowUnreadCounts() error {
+	states, err := Snapshot()
+	if err != nil {
+		return err
+	}
+
+	counts := make(map[string]int)
+	for _, state := range states {
+		target := windowTarget(state)
+		if target == "" {
+			continue
+		}
+		if _, exists := counts[target]; !exists {
+			counts[target] = 0
+		}
+		if state.State == StateUnread {
+			counts[target]++
+		}
+	}
+
+	var errs []error
+	for target, count := range counts {
+		if err := setWindowVar(target, WindowUnreadCountOption, strconv.Itoa(count)); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func windowTarget(state PaneState) string {
+	if dot := strings.LastIndex(state.Target, "."); dot >= 0 {
+		return state.Target[:dot]
+	}
+	if state.Session == "" {
+		return ""
+	}
+	return fmt.Sprintf("=%s:%d", state.Session, state.WindowIndex)
 }
 
 func withPaneLock(paneID string, operation func() error) error {
