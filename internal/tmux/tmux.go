@@ -290,6 +290,38 @@ func ListPanesFormat(format string) (string, error) {
 	return run("list-panes", "-a", "-F", format)
 }
 
+// CapturePane returns target's visible contents plus historyLines of scrollback
+// with escape sequences preserved. Attention callers strip ANSI and retain
+// only their configured tail before hashing.
+func CapturePane(target string, historyLines int) (string, error) {
+	args := []string{"capture-pane", "-p", "-e", "-J", "-t", target}
+	if historyLines > 0 {
+		args = append(args, "-S", fmt.Sprintf("-%d", historyLines))
+	}
+	cmd := exec.Command("tmux", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("tmux %s: %s (%w)", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
+	}
+	return strings.TrimSuffix(string(out), "\n"), nil
+}
+
+// FocusedPaneIDs returns every pane selected by an attached client. A pane is
+// considered visited when any client focuses it.
+func FocusedPaneIDs() (map[string]bool, error) {
+	out, err := run("list-clients", "-F", "#{pane_id}")
+	if err != nil {
+		return nil, err
+	}
+	focused := make(map[string]bool)
+	for _, paneID := range strings.Split(out, "\n") {
+		if paneID != "" {
+			focused[paneID] = true
+		}
+	}
+	return focused, nil
+}
+
 func SetCurrentPaneLabel(value string) error {
 	target, err := PaneID()
 	if err != nil {
