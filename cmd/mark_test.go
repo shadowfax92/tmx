@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,76 @@ import (
 
 	"github.com/spf13/cobra"
 )
+
+func TestCaptureStableAttentionBaselineBracketsScreenWithProcessSamples(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		processes []string
+		wantErr   bool
+	}{
+		{name: "stable", processes: []string{"101:claude", "101:claude"}},
+		{name: "rollover", processes: []string{"101:claude", "202:claude"}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			originalDiscover, originalCapture := discoverAttentionPanes, captureAttentionScreen
+			t.Cleanup(func() {
+				discoverAttentionPanes, captureAttentionScreen = originalDiscover, originalCapture
+			})
+
+			var events []string
+			sample := 0
+			discoverAttentionPanes = func([]string) ([]attn.DiscoveredPane, error) {
+				process := test.processes[sample]
+				sample++
+				events = append(events, "process:"+process)
+				return []attn.DiscoveredPane{{
+					PaneInfo: tmux.PaneInfo{ID: "%1"}, ProcessFingerprint: process,
+				}}, nil
+			}
+			captureAttentionScreen = func(target string, lines int) (string, error) {
+				events = append(events, fmt.Sprintf("capture:%s:%d", target, lines))
+				return "screen-hash", nil
+			}
+
+			baseline, err := captureStableAttentionBaseline("%1", 30, []string{"claude"})
+			if test.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "process changed") {
+					t.Fatalf("captureStableAttentionBaseline() error = %v, want rollover", err)
+				}
+			} else if err != nil || baseline.Hash != "screen-hash" ||
+				baseline.Lines != 30 || baseline.Process != "101:claude" {
+				t.Fatalf("captureStableAttentionBaseline() = %#v, %v", baseline, err)
+			}
+			if got := strings.Join(events, ","); got !=
+				"process:"+test.processes[0]+",capture:%1:30,process:"+test.processes[1] {
+				t.Fatalf("baseline sampling order = %q", got)
+			}
+		})
+	}
+}
+
+func TestCaptureStableAttentionBaselineRejectsMissingAgent(t *testing.T) {
+	originalDiscover, originalCapture := discoverAttentionPanes, captureAttentionScreen
+	t.Cleanup(func() {
+		discoverAttentionPanes, captureAttentionScreen = originalDiscover, originalCapture
+	})
+	discoverAttentionPanes = func([]string) ([]attn.DiscoveredPane, error) {
+		return nil, nil
+	}
+	captured := false
+	captureAttentionScreen = func(string, int) (string, error) {
+		captured = true
+		return "screen-hash", nil
+	}
+
+	_, err := captureStableAttentionBaseline("%1", 30, []string{"claude"})
+	if err == nil || !strings.Contains(err.Error(), "not a discovered agent pane") {
+		t.Fatalf("captureStableAttentionBaseline() error = %v, want missing agent", err)
+	}
+	if captured {
+		t.Fatal("screen captured without a contemporaneous agent process")
+	}
+}
 
 func TestMarkDefaultsToCurrentPaneAndReadClearsUnread(t *testing.T) {
 	fake := newFakeAttentionCommands(t)
@@ -30,8 +101,9 @@ func TestMarkDefaultsToCurrentPaneAndReadClearsUnread(t *testing.T) {
 	if got.target != "%current" || got.state.State != attn.StateQuiet || !got.state.Watch || !got.state.Fired {
 		t.Fatalf("mark read write = %#v, want watched quiet pane", got)
 	}
-	if got.state.Since != 500 {
-		t.Fatalf("mark read since = %d, want 500", got.state.Since)
+	if got.state.Since != 500 || got.state.ReadHash != "baseline:%current" ||
+		got.state.ReadLines != 30 || got.state.Proc != "101:claude" {
+		t.Fatalf("mark read state = %#v, want timestamp and captured baseline", got.state)
 	}
 }
 
@@ -55,8 +127,14 @@ func TestMarkReadIfUnreadClearsOnlyUnreadAndSilencesFailures(t *testing.T) {
 		}
 		got := fake.lastWrite()
 		if got.target != "%1" || got.state.State != attn.StateQuiet ||
-			got.state.Since != 500 || !got.state.Watch || !got.state.Fired {
+			got.state.Since != 500 || got.state.ReadHash != "baseline:%1" ||
+			got.state.ReadLines != 30 || got.state.Proc != "101:claude" ||
+			!got.state.Watch || !got.state.Fired {
 			t.Fatalf("conditional read write = %#v, want watched quiet pane", got)
+		}
+		if len(fake.captureTargets) != 1 || fake.captureTargets[0] != "%1" ||
+			!strings.Contains(strings.Join(fake.logs, "\n"), "read acknowledged pane=%1") {
+			t.Fatalf("captures=%v logs=%v, want acknowledged baseline", fake.captureTargets, fake.logs)
 		}
 	})
 
@@ -84,7 +162,95 @@ func TestMarkReadIfUnreadClearsOnlyUnreadAndSilencesFailures(t *testing.T) {
 			if len(fake.writes) != 0 {
 				t.Fatalf("writes = %#v, want none", fake.writes)
 			}
+			if test.err != nil && !strings.Contains(strings.Join(fake.logs, "\n"), "read failed target=%1") {
+				t.Fatalf("logs = %v, want silent hook failure recorded", fake.logs)
+			}
 		})
+	}
+}
+
+func TestMarkReadAcknowledgesCurrentAgentProcess(t *testing.T) {
+	fake := newFakeAttentionCommands(t)
+	fake.states["%1"] = attn.PaneState{
+		PaneInfo: tmux.PaneInfo{ID: "%1"},
+		Watch:    true, WatchSet: true, State: attn.StateUnread,
+		Since: 10, Proc: "101:claude", Fired: true,
+	}
+	fake.baselineProcess = "202:claude"
+
+	if _, err := executeAttentionCommand(newMarkCommand(), "read", "-t", "%1"); err != nil {
+		t.Fatalf("mark read error = %v", err)
+	}
+	got := fake.lastWrite().state
+	if got.State != attn.StateQuiet || got.Proc != "202:claude" {
+		t.Fatalf("mark read state = %#v, want current process acknowledged", got)
+	}
+}
+
+func TestMarkReadIfUnreadLogsBaselineCaptureFailureWithoutClearing(t *testing.T) {
+	fake := newFakeAttentionCommands(t)
+	fake.states["%1"] = attn.PaneState{
+		PaneInfo: tmux.PaneInfo{ID: "%1"},
+		Watch:    true, WatchSet: true, State: attn.StateUnread, Since: 10, Fired: true,
+	}
+	fake.captureErr = errors.New("capture failed")
+
+	output, err := executeAttentionCommand(newMarkCommand(), "read", "--if-unread", "-t", "%1")
+	if err != nil || output != "" {
+		t.Fatalf("mark read --if-unread = output %q, error %v; want silent success", output, err)
+	}
+	if len(fake.writes) != 0 || fake.states["%1"].State != attn.StateUnread {
+		t.Fatalf("writes=%#v state=%#v, want unread preserved", fake.writes, fake.states["%1"])
+	}
+	logs := strings.Join(fake.logs, "\n")
+	if !strings.Contains(logs, "read failed target=%1") || !strings.Contains(logs, "capture failed") {
+		t.Fatalf("logs = %q, want baseline capture failure", logs)
+	}
+}
+
+func TestMarkReadLogsAndReturnsSharedReadFailures(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		captureErr error
+		setErr     error
+	}{
+		{name: "capture", captureErr: errors.New("capture failed")},
+		{name: "state write", setErr: errors.New("state write failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := newFakeAttentionCommands(t)
+			fake.states["%1"] = attn.PaneState{
+				PaneInfo: tmux.PaneInfo{ID: "%1"},
+				Watch:    true, WatchSet: true, State: attn.StateUnread,
+			}
+			fake.captureErr = test.captureErr
+			fake.setErr = test.setErr
+
+			_, err := executeAttentionCommand(newMarkCommand(), "read", "-t", "%1")
+			if err == nil {
+				t.Fatal("mark read error = nil, want shared read failure")
+			}
+			if logs := strings.Join(fake.logs, "\n"); !strings.Contains(logs, "read failed pane=%1") {
+				t.Fatalf("logs = %q, want shared read failure", logs)
+			}
+		})
+	}
+}
+
+func TestMarkReadRejectsEmptyProcessBaseline(t *testing.T) {
+	fake := newFakeAttentionCommands(t)
+	fake.states["%1"] = attn.PaneState{
+		PaneInfo: tmux.PaneInfo{ID: "%1"},
+		Watch:    true, WatchSet: true, State: attn.StateUnread, Proc: "stale:claude",
+	}
+	fake.baselineProcess = ""
+
+	_, err := executeAttentionCommand(newMarkCommand(), "read", "-t", "%1")
+	if err == nil || !strings.Contains(err.Error(), "missing agent process fingerprint") {
+		t.Fatalf("mark read error = %v, want missing process rejection", err)
+	}
+	if len(fake.writes) != 0 {
+		t.Fatalf("writes = %#v, want unread state preserved", fake.writes)
 	}
 }
 
@@ -231,14 +397,22 @@ type fakeAttentionCommands struct {
 	unreadCount        int
 	inside             bool
 	conditionalErr     error
+	captureErr         error
+	setErr             error
+	captureTargets     []string
+	logs               []string
+	baselineLines      int
+	baselineProcess    string
 }
 
 func newFakeAttentionCommands(t *testing.T) *fakeAttentionCommands {
 	t.Helper()
 	fake := &fakeAttentionCommands{
-		states:   make(map[string]attn.PaneState),
-		resolved: make(map[string]string),
-		inside:   true,
+		states:          make(map[string]attn.PaneState),
+		resolved:        make(map[string]string),
+		inside:          true,
+		baselineLines:   30,
+		baselineProcess: "101:claude",
 	}
 
 	originalGet, originalSet := getAttentionState, setAttentionState
@@ -246,12 +420,16 @@ func newFakeAttentionCommands(t *testing.T) *fakeAttentionCommands {
 	originalDiscover, originalCurrent := discoverAttentionPanes, currentAttentionPane
 	originalInside, originalNow := insideTmux, attentionNow
 	originalLoadAgents := loadAttentionAgents
+	originalCaptureBaseline, originalLogEvent := captureAttentionBaseline, logAttentionEvent
+	originalCaptureScreen := captureAttentionScreen
 	t.Cleanup(func() {
 		getAttentionState, setAttentionState = originalGet, originalSet
 		updateAttentionIfUnread = originalUpdateIfUnread
 		discoverAttentionPanes, currentAttentionPane = originalDiscover, originalCurrent
 		insideTmux, attentionNow = originalInside, originalNow
 		loadAttentionAgents = originalLoadAgents
+		captureAttentionBaseline, logAttentionEvent = originalCaptureBaseline, originalLogEvent
+		captureAttentionScreen = originalCaptureScreen
 	})
 
 	getAttentionState = func(target string) (attn.PaneState, error) {
@@ -268,6 +446,9 @@ func newFakeAttentionCommands(t *testing.T) *fakeAttentionCommands {
 		return state, nil
 	}
 	setAttentionState = func(target string, state attn.PaneState) error {
+		if fake.setErr != nil {
+			return fake.setErr
+		}
 		previous := fake.states[target]
 		if previous.State == attn.StateUnread && state.State != attn.StateUnread && fake.unreadCount > 0 {
 			fake.unreadCount--
@@ -289,6 +470,9 @@ func newFakeAttentionCommands(t *testing.T) *fakeAttentionCommands {
 			return nil
 		}
 		next := update(state)
+		if next == state {
+			return nil
+		}
 		return setAttentionState(target, next)
 	}
 	discoverAttentionPanes = func([]string) ([]attn.DiscoveredPane, error) {
@@ -298,6 +482,21 @@ func newFakeAttentionCommands(t *testing.T) *fakeAttentionCommands {
 	insideTmux = func() bool { return fake.inside }
 	attentionNow = func() time.Time { return time.Unix(500, 0) }
 	loadAttentionAgents = func() ([]string, error) { return []string{"claude", "codex"}, nil }
+	captureAttentionBaseline = func(target string) (attentionReadBaseline, error) {
+		fake.captureTargets = append(fake.captureTargets, target)
+		if fake.captureErr != nil {
+			return attentionReadBaseline{}, fake.captureErr
+		}
+		return attentionReadBaseline{
+			Hash:    "baseline:" + target,
+			Lines:   fake.baselineLines,
+			Process: fake.baselineProcess,
+		}, nil
+	}
+	logAttentionEvent = func(format string, args ...any) error {
+		fake.logs = append(fake.logs, fmt.Sprintf(format, args...))
+		return nil
+	}
 	return fake
 }
 

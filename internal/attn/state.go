@@ -18,6 +18,8 @@ const (
 	HashOption              = "attn_hash"
 	ProcOption              = "attn_proc"
 	FiredOption             = "attn_fired"
+	ReadHashOption          = "attn_read_hash"
+	ReadLinesOption         = "attn_read_lines"
 	WindowUnreadCountOption = "attn_unread_count"
 )
 
@@ -44,11 +46,15 @@ type PaneState struct {
 	Hash              string
 	Proc              string
 	Fired             bool
+	// ReadHash is the public screen baseline last acknowledged by the user.
+	// Hash and Fired remain watcher-private rolling episode state.
+	ReadHash  string
+	ReadLines int
 }
 
 const (
-	snapshotFormat  = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{@fip_buffer}\t#{pane_current_path}\t#{window_id}\t#{window_activity}\t#{@attn_unread_count}\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_changed}\t#{@attn_proc}\t_"
-	paneStateFormat = "_\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_changed}\t#{@attn_proc}\t_"
+	snapshotFormat  = "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{@fip_buffer}\t#{pane_current_path}\t#{window_id}\t#{window_activity}\t#{@attn_unread_count}\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_changed}\t#{@attn_proc}\t#{@attn_read_hash}\t#{@attn_read_lines}\t_"
+	paneStateFormat = "_\t#{@attn_watch}\t#{@attn_state}\t#{@attn_since}\t#{@attn_changed}\t#{@attn_proc}\t#{@attn_read_hash}\t#{@attn_read_lines}\t_"
 )
 
 var (
@@ -79,8 +85,8 @@ func Snapshot() ([]PaneState, error) {
 
 	var states []PaneState
 	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "\t", 20)
-		if len(parts) != 20 {
+		parts := strings.SplitN(line, "\t", 22)
+		if len(parts) != 22 {
 			continue
 		}
 		windowIndex, _ := strconv.Atoi(parts[3])
@@ -90,6 +96,7 @@ func Snapshot() ([]PaneState, error) {
 		windowUnreadCount, _ := strconv.Atoi(parts[13])
 		since, _ := strconv.ParseInt(parts[16], 10, 64)
 		changed, _ := strconv.ParseInt(parts[17], 10, 64)
+		readLines, _ := strconv.Atoi(parts[20])
 		states = append(states, PaneState{
 			PaneInfo: tmux.PaneInfo{
 				ID:          parts[0],
@@ -113,6 +120,8 @@ func Snapshot() ([]PaneState, error) {
 			Since:             since,
 			Changed:           changed,
 			Proc:              parts[18],
+			ReadHash:          parts[19],
+			ReadLines:         readLines,
 		})
 	}
 	return states, nil
@@ -165,19 +174,22 @@ func readPaneState(paneID string) (PaneState, error) {
 }
 
 func parsePaneState(out, paneID string) (PaneState, error) {
-	values := strings.SplitN(out, "\t", 7)
-	if len(values) != 7 || values[0] != "_" || values[6] != "_" {
+	values := strings.SplitN(out, "\t", 9)
+	if len(values) != 9 || values[0] != "_" || values[8] != "_" {
 		return PaneState{}, fmt.Errorf("reading attention state for %s: malformed tmux response", paneID)
 	}
 	since, _ := strconv.ParseInt(values[3], 10, 64)
 	changed, _ := strconv.ParseInt(values[4], 10, 64)
+	readLines, _ := strconv.Atoi(values[7])
 	return PaneState{
-		Watch:    values[1] == "1",
-		WatchSet: values[1] != "",
-		State:    AttentionState(values[2]),
-		Since:    since,
-		Changed:  changed,
-		Proc:     values[5],
+		Watch:     values[1] == "1",
+		WatchSet:  values[1] != "",
+		State:     AttentionState(values[2]),
+		Since:     since,
+		Changed:   changed,
+		Proc:      values[5],
+		ReadHash:  values[6],
+		ReadLines: readLines,
 	}, nil
 }
 
@@ -282,6 +294,12 @@ func writePaneState(paneID string, previous, state PaneState) error {
 	appendSet(previous.Since != state.Since, SinceOption, strconv.FormatInt(state.Since, 10))
 	appendSet(previous.Changed != state.Changed, ChangedOption, strconv.FormatInt(state.Changed, 10))
 	appendSet(previous.Proc != state.Proc, ProcOption, state.Proc)
+	appendSet(previous.ReadHash != state.ReadHash, ReadHashOption, state.ReadHash)
+	appendSet(
+		previous.ReadLines != state.ReadLines,
+		ReadLinesOption,
+		strconv.Itoa(state.ReadLines),
+	)
 	// State is last so readers never see a new state with stale companion
 	// fields while tmux processes the command batch.
 	appendSet(previous.State != state.State, StateOption, string(state.State))
@@ -309,7 +327,10 @@ func Clear(target string) error {
 		}
 
 		var commands [][]string
-		for _, key := range []string{WatchOption, StateOption, SinceOption, ChangedOption, HashOption, ProcOption, FiredOption} {
+		for _, key := range []string{
+			WatchOption, StateOption, SinceOption, ChangedOption,
+			HashOption, ProcOption, FiredOption, ReadHashOption, ReadLinesOption,
+		} {
 			commands = append(commands, []string{"set-option", "-p", "-u", "-t", paneID, "@" + key})
 		}
 		if previous.State == StateUnread {
@@ -389,7 +410,9 @@ func samePublicState(left, right PaneState) bool {
 		left.State == right.State &&
 		left.Since == right.Since &&
 		left.Changed == right.Changed &&
-		left.Proc == right.Proc
+		left.Proc == right.Proc &&
+		left.ReadHash == right.ReadHash &&
+		left.ReadLines == right.ReadLines
 }
 
 func withPaneLock(paneID string, operation func() error) error {

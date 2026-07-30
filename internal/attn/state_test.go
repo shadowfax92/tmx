@@ -17,13 +17,13 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 		t.Fatalf("Get() absent state error = %v", err)
 	}
 	if got.Watch || got.WatchSet || got.State != "" || got.Since != 0 || got.Changed != 0 ||
-		got.Hash != "" || got.Proc != "" || got.Fired {
+		got.Hash != "" || got.Proc != "" || got.ReadHash != "" || got.ReadLines != 0 || got.Fired {
 		t.Fatalf("Get() absent state = %#v, want zero values", got)
 	}
 
 	want := PaneState{
 		Watch: true, State: StateUnread, Since: 1234, Changed: 1200,
-		Hash: "screen-a", Proc: "claude", Fired: true,
+		Hash: "screen-a", Proc: "claude", ReadHash: "ack-a", ReadLines: 30, Fired: true,
 	}
 	if err := Set("%1", want); err != nil {
 		t.Fatalf("Set() error = %v", err)
@@ -34,7 +34,7 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 	}
 	if got.ID != "%1" || !got.Watch || !got.WatchSet || got.State != StateUnread ||
 		got.Since != 1234 || got.Changed != 1200 || got.Hash != "" ||
-		got.Proc != "claude" || got.Fired {
+		got.Proc != "claude" || got.ReadHash != "ack-a" || got.ReadLines != 30 || got.Fired {
 		t.Fatalf("Get() = %#v, want written contract", got)
 	}
 	if fake.batchCalls != 1 {
@@ -43,6 +43,14 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 	firstBatch := strings.Join(fake.batches[0], " ")
 	if strings.Contains(firstBatch, "@attn_hash") || strings.Contains(firstBatch, "@attn_fired") {
 		t.Fatalf("daemon-private fields leaked into tmux batch: %q", firstBatch)
+	}
+	if !strings.Contains(firstBatch, "@attn_read_hash") ||
+		!strings.Contains(firstBatch, "@attn_read_lines") {
+		t.Fatalf("read baseline metadata missing from tmux batch: %q", firstBatch)
+	}
+	if strings.Index(firstBatch, "@attn_read_hash") > strings.Index(firstBatch, "@attn_state") ||
+		strings.Index(firstBatch, "@attn_read_lines") > strings.Index(firstBatch, "@attn_state") {
+		t.Fatalf("state published before its read baseline: %q", firstBatch)
 	}
 	if fake.windowCount != 1 {
 		t.Fatalf("window unread count = %d, want 1", fake.windowCount)
@@ -76,7 +84,7 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 		t.Fatalf("Get() after Clear error = %v", err)
 	}
 	if got.WatchSet || got.State != "" || got.Since != 0 || got.Changed != 0 ||
-		got.Hash != "" || got.Proc != "" || got.Fired {
+		got.Hash != "" || got.Proc != "" || got.ReadHash != "" || got.ReadLines != 0 || got.Fired {
 		t.Fatalf("Get() after Clear = %#v, want zero values", got)
 	}
 	if fake.windowCount != 0 {
@@ -85,11 +93,12 @@ func TestPaneStateSetGetClearAndMissingOptions(t *testing.T) {
 }
 
 func TestParsePaneStatePreservesMissingLeadingOptionsAfterTmuxTrimming(t *testing.T) {
-	got, err := parsePaneState("_\t\t\t\t\t\t_", "%1")
+	got, err := parsePaneState("_\t\t\t\t\t\t\t\t_", "%1")
 	if err != nil {
 		t.Fatalf("parsePaneState() error = %v", err)
 	}
-	if got.WatchSet || got.State != "" || got.Since != 0 || got.Changed != 0 || got.Proc != "" {
+	if got.WatchSet || got.State != "" || got.Since != 0 || got.Changed != 0 ||
+		got.Proc != "" || got.ReadHash != "" || got.ReadLines != 0 {
 		t.Fatalf("parsePaneState() = %#v, want absent public state", got)
 	}
 }
@@ -136,20 +145,23 @@ func TestUpdateIfUnreadUsesSetTransitionAndRechecksUnderLock(t *testing.T) {
 	t.Run("updates unread state", func(t *testing.T) {
 		fake := newFakeStateBackend()
 		fake.options["%1"] = map[string]string{
-			WatchOption:   "1",
-			StateOption:   string(StateUnread),
-			SinceOption:   "42",
-			ChangedOption: "40",
-			HashOption:    "screen",
-			ProcOption:    "101:claude",
-			FiredOption:   "1",
+			WatchOption:     "1",
+			StateOption:     string(StateUnread),
+			SinceOption:     "42",
+			ChangedOption:   "40",
+			HashOption:      "screen",
+			ProcOption:      "101:claude",
+			ReadHashOption:  "ack-screen",
+			ReadLinesOption: "30",
+			FiredOption:     "1",
 		}
 		fake.windowCount = 1
 		stubStateBackend(t, fake)
 
 		err := UpdateIfUnread("%1", func(state PaneState) PaneState {
 			if state.ID != "%1" || !state.Watch || state.Hash != "" ||
-				state.Proc != "101:claude" {
+				state.Proc != "101:claude" || state.ReadHash != "ack-screen" ||
+				state.ReadLines != 30 {
 				t.Fatalf("update state = %#v, want complete public pane state", state)
 			}
 			state.State = StateQuiet
@@ -203,8 +215,8 @@ func TestUpdateIfUnreadUsesSetTransitionAndRechecksUnderLock(t *testing.T) {
 func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	fake := newFakeStateBackend()
 	fake.listOutput = strings.Join([]string{
-		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "review", "claude", "", "/tmp/a", "@1", "100", "1", "1", "unread", "42", "40", "claude", "_"}, "\t"),
-		strings.Join([]string{"%2", "other:3.1", "other", "3", "shell", "1", "202", "", "zsh", "", "/tmp/b", "@2", "200", "0", "", "", "", "", "", "_"}, "\t"),
+		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "review", "claude", "", "/tmp/a", "@1", "100", "1", "1", "unread", "42", "40", "claude", "ack-screen", "30", "_"}, "\t"),
+		strings.Join([]string{"%2", "other:3.1", "other", "3", "shell", "1", "202", "", "zsh", "", "/tmp/b", "@2", "200", "0", "", "", "", "", "", "", "", "_"}, "\t"),
 	}, "\n")
 	stubStateBackend(t, fake)
 
@@ -217,7 +229,8 @@ func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	}
 	for _, option := range []string{
 		"#{@attn_watch}", "#{@attn_state}", "#{@attn_since}", "#{@attn_changed}",
-		"#{@attn_proc}", "#{window_activity}", "#{@attn_unread_count}",
+		"#{@attn_proc}", "#{@attn_read_hash}", "#{@attn_read_lines}",
+		"#{window_activity}", "#{@attn_unread_count}",
 	} {
 		if !strings.Contains(fake.listFormat, option) {
 			t.Fatalf("snapshot format %q missing %s", fake.listFormat, option)
@@ -232,12 +245,14 @@ func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	}
 	if got[0].ID != "%1" || !got[0].Watch || got[0].State != StateUnread ||
 		got[0].Since != 42 || got[0].Changed != 40 || got[0].Hash != "" ||
-		got[0].Proc != "claude" || got[0].Fired || got[0].WindowID != "@1" ||
+		got[0].Proc != "claude" || got[0].ReadHash != "ack-screen" ||
+		got[0].ReadLines != 30 || got[0].Fired || got[0].WindowID != "@1" ||
 		got[0].WindowActivity != 100 || got[0].WindowUnreadCount != 1 {
 		t.Fatalf("watched snapshot = %#v", got[0])
 	}
 	if got[1].ID != "%2" || got[1].WatchSet || got[1].State != "" || got[1].Since != 0 ||
-		got[1].Changed != 0 || got[1].Hash != "" || got[1].Proc != "" || got[1].Fired {
+		got[1].Changed != 0 || got[1].Hash != "" || got[1].Proc != "" ||
+		got[1].ReadHash != "" || got[1].ReadLines != 0 || got[1].Fired {
 		t.Fatalf("absent snapshot = %#v, want zero state", got[1])
 	}
 }
@@ -256,8 +271,8 @@ func TestSnapshotTreatsMissingTmuxServerAsEmpty(t *testing.T) {
 func TestReconcileWindowUnreadCountsDropsOrphanedPaneCount(t *testing.T) {
 	fake := newFakeStateBackend()
 	fake.listOutput = strings.Join([]string{
-		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "", "claude", "", "/tmp/a", "@1", "90", "2", "1", "quiet", "42", "40", "claude", "_"}, "\t"),
-		strings.Join([]string{"%2", "work:2.0", "work", "2", "other", "0", "202", "", "codex", "", "/tmp/b", "@2", "91", "0", "1", "unread", "43", "41", "codex", "_"}, "\t"),
+		strings.Join([]string{"%1", "work:1.0", "work", "1", "agent", "0", "101", "", "claude", "", "/tmp/a", "@1", "90", "2", "1", "quiet", "42", "40", "claude", "", "", "_"}, "\t"),
+		strings.Join([]string{"%2", "work:2.0", "work", "2", "other", "0", "202", "", "codex", "", "/tmp/b", "@2", "91", "0", "1", "unread", "43", "41", "codex", "", "", "_"}, "\t"),
 	}, "\n")
 	stubStateBackend(t, fake)
 
@@ -429,6 +444,8 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 				options[SinceOption],
 				options[ChangedOption],
 				options[ProcOption],
+				options[ReadHashOption],
+				options[ReadLinesOption],
 				"_",
 			}, "\t"), nil
 		}
