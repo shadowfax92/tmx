@@ -1,9 +1,8 @@
 // Package config owns tmx's YAML config at ~/.config/tmx/config.yaml.
 //
-// tmx only configures scratch popups, so the schema is a single `scratch`
-// block: a TTL for idle reaping, a per-type keybind map, a per-type popup
-// definition (command + size), and optional width-matched profiles that
-// override sizes for specific clients (e.g. a small laptop screen).
+// The schema contains scratch popup settings and attention-watch settings.
+// Width-matched scratch profiles also carry client-specific navigation
+// behavior shared by attention commands.
 package config
 
 import (
@@ -20,13 +19,19 @@ import (
 )
 
 const (
-	DefaultTTL         = 6 * time.Hour
-	defaultPopupWidth  = "90%"
-	defaultPopupHeight = "90%"
+	DefaultTTL          = 6 * time.Hour
+	DefaultWatchPoll    = 3 * time.Second
+	DefaultWatchPeriod  = 30 * time.Second
+	DefaultWatchReapTTL = 24 * time.Hour
+	DefaultGracePeriods = 3
+	DefaultCaptureLines = 30
+	defaultPopupWidth   = "90%"
+	defaultPopupHeight  = "90%"
 )
 
 type Config struct {
 	Scratch ScratchConfig `yaml:"scratch"`
+	Watch   WatchConfig   `yaml:"watch"`
 }
 
 type ScratchConfig struct {
@@ -34,6 +39,34 @@ type ScratchConfig struct {
 	Keys     map[string]string    `yaml:"keys"`
 	Popups   map[string]PopupSpec `yaml:"popups"`
 	Profiles []PopupProfile       `yaml:"profiles"`
+}
+
+type WatchConfig struct {
+	Poll         Duration `yaml:"poll"`
+	GracePeriods int      `yaml:"grace_periods"`
+	Period       Duration `yaml:"period"`
+	CaptureLines int      `yaml:"capture_lines"`
+	Agents       []string `yaml:"agents"`
+	ReapTTL      Duration `yaml:"reap_ttl"`
+}
+
+type JumpAction string
+
+const (
+	JumpActionSelect JumpAction = "select"
+	JumpActionFocus  JumpAction = "focus"
+	JumpActionZoom   JumpAction = "zoom"
+)
+
+func (a *JumpAction) UnmarshalYAML(value *yaml.Node) error {
+	action := JumpAction(strings.TrimSpace(value.Value))
+	switch action {
+	case JumpActionSelect, JumpActionFocus, JumpActionZoom:
+		*a = action
+		return nil
+	default:
+		return fmt.Errorf("invalid jump_action %q (want select, focus, or zoom)", value.Value)
+	}
 }
 
 // PopupSpec defines one scratch type: the command to run (empty = login shell)
@@ -54,13 +87,14 @@ type PopupMatch struct {
 	MaxClientWidth int `yaml:"max_client_width,omitempty"`
 }
 
-// PopupProfile overrides popup sizes for clients matching a width band (or
-// selected explicitly via $TMX_PROFILE). Only sizes are per-profile; the
-// command always comes from the top-level popup definition.
+// PopupProfile overrides client-specific behavior for a width band (or when
+// selected explicitly via $TMX_PROFILE). Popup commands always come from the
+// top-level popup definition.
 type PopupProfile struct {
-	Name   string               `yaml:"name"`
-	Match  PopupMatch           `yaml:"match,omitempty"`
-	Popups map[string]PopupSize `yaml:"popups,omitempty"`
+	Name       string               `yaml:"name"`
+	Match      PopupMatch           `yaml:"match,omitempty"`
+	Popups     map[string]PopupSize `yaml:"popups,omitempty"`
+	JumpAction JumpAction           `yaml:"jump_action,omitempty"`
 }
 
 // Duration is a time.Duration that unmarshals from YAML strings like "6h",
@@ -145,9 +179,27 @@ func (c *Config) resolve() {
 	if len(c.Scratch.Keys) == 0 {
 		c.Scratch.Keys = map[string]string{"vim": "M-v", "sh": "M-b"}
 	}
+	if c.Watch.Poll <= 0 {
+		c.Watch.Poll = Duration(DefaultWatchPoll)
+	}
+	if c.Watch.GracePeriods <= 0 {
+		c.Watch.GracePeriods = DefaultGracePeriods
+	}
+	if c.Watch.Period <= 0 {
+		c.Watch.Period = Duration(DefaultWatchPeriod)
+	}
+	if c.Watch.CaptureLines <= 0 {
+		c.Watch.CaptureLines = DefaultCaptureLines
+	}
+	if len(c.Watch.Agents) == 0 {
+		c.Watch.Agents = []string{"claude", "codex"}
+	}
+	if c.Watch.ReapTTL <= 0 {
+		c.Watch.ReapTTL = Duration(DefaultWatchReapTTL)
+	}
 }
 
-const defaultConfigBody = `# tmx configuration — scratch popup sessions
+const defaultConfigBody = `# tmx configuration
 # Docs: tmx scratch --help, tmx reap --help
 
 scratch:
@@ -171,9 +223,18 @@ scratch:
   # profiles:
   #   - name: laptop
   #     match: { max_client_width: 310 }
+  #     jump_action: zoom
   #     popups:
   #       vim: { width: "95%", height: "95%" }
   #       sh: { width: "95%", height: "95%" }
+
+watch:
+  poll: 3s
+  grace_periods: 3
+  period: 30s
+  capture_lines: 30
+  agents: [claude, codex]
+  reap_ttl: 24h
 `
 
 func createDefault(path string) (*Config, error) {
@@ -246,6 +307,26 @@ func (c ScratchConfig) ResolvePopup(typ string) (PopupSize, string) {
 		name = profile.Name
 	}
 	return size, name
+}
+
+// ResolveJumpAction returns the navigation action selected for the current
+// client width, plus the active profile name. Profiles without an explicit
+// action use select.
+func (c ScratchConfig) ResolveJumpAction() (JumpAction, string) {
+	return c.JumpActionFor(TmuxClientWidth())
+}
+
+// JumpActionFor resolves the navigation action through the same profile
+// selection used for popup sizes.
+func (c ScratchConfig) JumpActionFor(clientWidth int) (JumpAction, string) {
+	profile := c.SelectProfile(clientWidth)
+	if profile == nil {
+		return JumpActionSelect, ""
+	}
+	if profile.JumpAction == "" {
+		return JumpActionSelect, profile.Name
+	}
+	return profile.JumpAction, profile.Name
 }
 
 // SelectProfile returns the profile chosen by $TMX_PROFILE or by matching the

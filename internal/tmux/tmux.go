@@ -27,6 +27,7 @@ type WindowInfo struct {
 }
 
 type PaneInfo struct {
+	ID          string
 	Target      string
 	Session     string
 	WindowIndex int
@@ -36,6 +37,7 @@ type PaneInfo struct {
 	Label       string
 	Command     string
 	Path        string
+	FIPBuffer   bool
 }
 
 // ScratchSnapshot bundles a scratch session's metadata, read in a single
@@ -390,7 +392,7 @@ func ListWindowInfo() ([]WindowInfo, error) {
 }
 
 func ListPaneInfo() ([]PaneInfo, error) {
-	out, err := run("list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{pane_current_path}")
+	out, err := run("list-panes", "-a", "-F", "#{pane_id}\t#{session_name}:#{window_index}.#{pane_index}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_pid}\t#{@pane_label}\t#{pane_current_command}\t#{@fip_buffer}\t#{pane_current_path}")
 	if err != nil {
 		if strings.Contains(err.Error(), "no server running") || strings.Contains(err.Error(), "no sessions") {
 			return nil, nil
@@ -402,23 +404,25 @@ func ListPaneInfo() ([]PaneInfo, error) {
 	}
 	var panes []PaneInfo
 	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "\t", 9)
-		if len(parts) < 9 {
+		parts := strings.SplitN(line, "\t", 11)
+		if len(parts) < 11 {
 			continue
 		}
-		winIdx, _ := strconv.Atoi(parts[2])
-		paneIdx, _ := strconv.Atoi(parts[4])
-		pid, _ := strconv.Atoi(parts[5])
+		winIdx, _ := strconv.Atoi(parts[3])
+		paneIdx, _ := strconv.Atoi(parts[5])
+		pid, _ := strconv.Atoi(parts[6])
 		panes = append(panes, PaneInfo{
-			Target:      parts[0],
-			Session:     parts[1],
+			ID:          parts[0],
+			Target:      parts[1],
+			Session:     parts[2],
 			WindowIndex: winIdx,
-			WindowName:  parts[3],
+			WindowName:  parts[4],
 			PaneIndex:   paneIdx,
 			PID:         pid,
-			Label:       parts[6],
-			Command:     parts[7],
-			Path:        parts[8],
+			Label:       parts[7],
+			Command:     parts[8],
+			FIPBuffer:   parts[9] != "",
+			Path:        parts[10],
 		})
 	}
 	return panes, nil
