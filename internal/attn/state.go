@@ -173,8 +173,8 @@ func readPaneState(paneID string) (PaneState, error) {
 // Set writes the complete pane contract and updates the window unread count
 // when the pane crosses the unread boundary.
 func Set(target string, state PaneState) error {
-	if state.State != StateActive && state.State != StateQuiet && state.State != StateUnread {
-		return fmt.Errorf("invalid attention state %q", state.State)
+	if err := validatePaneState(state); err != nil {
+		return err
 	}
 	paneID, err := ResolveTarget(target)
 	if err != nil {
@@ -186,41 +186,91 @@ func Set(target string, state PaneState) error {
 			return err
 		}
 
-		watch := "0"
-		if state.Watch {
-			watch = "1"
-		}
-		fired := "0"
-		if state.Fired {
-			fired = "1"
-		}
-		values := []struct {
-			key   string
-			value string
-		}{
-			{WatchOption, watch},
-			{SinceOption, strconv.FormatInt(state.Since, 10)},
-			{ChangedOption, strconv.FormatInt(state.Changed, 10)},
-			{HashOption, state.Hash},
-			{ProcOption, state.Proc},
-			{FiredOption, fired},
-			{StateOption, string(state.State)},
-		}
-		for _, value := range values {
-			if err := setPaneVar(paneID, value.key, value.value); err != nil {
-				return err
-			}
-		}
+		return setPaneStateLocked(paneID, AttentionState(previous), state)
+	})
+}
 
-		switch {
-		case AttentionState(previous) != StateUnread && state.State == StateUnread:
-			return adjustWindowVar(paneID, WindowUnreadCountOption, 1)
-		case AttentionState(previous) == StateUnread && state.State != StateUnread:
-			return adjustWindowVar(paneID, WindowUnreadCountOption, -1)
-		default:
+// UpdateIfUnread applies update only while target is unread. The common no-op
+// path reads only @attn_state; resolution, locking, and the full state read are
+// deferred until that option says unread. The state is checked again under the
+// pane lock so a concurrent transition wins instead of being overwritten.
+func UpdateIfUnread(target string, update func(PaneState) PaneState) error {
+	current, err := showPaneVar(normalizeTarget(target), StateOption)
+	if err != nil {
+		return err
+	}
+	if AttentionState(current) != StateUnread {
+		return nil
+	}
+
+	paneID, err := ResolveTarget(target)
+	if err != nil {
+		return err
+	}
+	return withPaneLock(paneID, func() error {
+		current, err := showPaneVar(paneID, StateOption)
+		if err != nil {
+			return err
+		}
+		if AttentionState(current) != StateUnread {
 			return nil
 		}
+
+		state, err := readPaneState(paneID)
+		if err != nil {
+			return err
+		}
+		state.ID = paneID
+		next := update(state)
+		if err := validatePaneState(next); err != nil {
+			return err
+		}
+		return setPaneStateLocked(paneID, StateUnread, next)
 	})
+}
+
+func validatePaneState(state PaneState) error {
+	if state.State != StateActive && state.State != StateQuiet && state.State != StateUnread {
+		return fmt.Errorf("invalid attention state %q", state.State)
+	}
+	return nil
+}
+
+func setPaneStateLocked(paneID string, previous AttentionState, state PaneState) error {
+	watch := "0"
+	if state.Watch {
+		watch = "1"
+	}
+	fired := "0"
+	if state.Fired {
+		fired = "1"
+	}
+	values := []struct {
+		key   string
+		value string
+	}{
+		{WatchOption, watch},
+		{SinceOption, strconv.FormatInt(state.Since, 10)},
+		{ChangedOption, strconv.FormatInt(state.Changed, 10)},
+		{HashOption, state.Hash},
+		{ProcOption, state.Proc},
+		{FiredOption, fired},
+		{StateOption, string(state.State)},
+	}
+	for _, value := range values {
+		if err := setPaneVar(paneID, value.key, value.value); err != nil {
+			return err
+		}
+	}
+
+	switch {
+	case previous != StateUnread && state.State == StateUnread:
+		return adjustWindowVar(paneID, WindowUnreadCountOption, 1)
+	case previous == StateUnread && state.State != StateUnread:
+		return adjustWindowVar(paneID, WindowUnreadCountOption, -1)
+	default:
+		return nil
+	}
 }
 
 // Clear unsets the complete pane contract. Clearing an unread pane also
