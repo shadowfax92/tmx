@@ -98,8 +98,9 @@ type ReapFailure struct {
 }
 
 type ReapReport struct {
-	Removed []ReapCandidate
-	Failed  []ReapFailure
+	Removed   []ReapCandidate
+	Protected []ReapCandidate
+	Failed    []ReapFailure
 }
 
 func NewWatcher(options WatchOptions) (*Watcher, error) {
@@ -163,16 +164,19 @@ func selectReapCandidates(
 	return selection
 }
 
-// ReapPanes clears attention state, kills every selected pane, and then
-// repairs window aggregates from the surviving pane inventory.
+// ReapPanes protects panes focused since selection, kills the rest, and then
+// repairs window aggregates from the surviving pane inventory. Successful
+// kill-pane calls remove pane-scoped attention state with the pane itself.
 func ReapPanes(candidates []ReapCandidate) (ReapReport, error) {
 	var report ReapReport
 	var errs []error
+	focused, err := watchFocused()
+	if err != nil {
+		return report, fmt.Errorf("checking focused panes before reap: %w", err)
+	}
 	for _, candidate := range candidates {
-		if err := watchClear(candidate.ID); err != nil {
-			wrapped := fmt.Errorf("clearing %s attention state: %w", candidate.ID, err)
-			report.Failed = append(report.Failed, ReapFailure{Candidate: candidate, Err: wrapped})
-			errs = append(errs, wrapped)
+		if focused[candidate.ID] {
+			report.Protected = append(report.Protected, candidate)
 			continue
 		}
 		if err := watchKillPane(candidate.ID); err != nil {

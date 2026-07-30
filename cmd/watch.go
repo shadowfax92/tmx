@@ -210,6 +210,14 @@ func confirmWatchReap(r io.Reader) (bool, error) {
 
 func printWatchReapReport(w io.Writer, report attn.ReapReport) {
 	fmt.Fprintf(w, "Reaped %d stale agent panes.\n", len(report.Removed))
+	if len(report.Protected) > 0 {
+		fmt.Fprintf(
+			w,
+			"Protected %d %s focused after selection.\n",
+			len(report.Protected),
+			plural(len(report.Protected), "pane", "panes"),
+		)
+	}
 	if len(report.Failed) > 0 {
 		fmt.Fprintf(w, "Failed to reap %d:\n", len(report.Failed))
 		for _, failure := range report.Failed {

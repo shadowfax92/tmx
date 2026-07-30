@@ -197,20 +197,17 @@ func TestSelectReapCandidatesUsesLastScreenChangeIncludesUnwatchedAndProtectsFoc
 	}
 }
 
-func TestReapPanesClearsStateKillsEveryPaneAndReconcilesAggregates(t *testing.T) {
-	originalClear, originalKill := watchClear, watchKillPane
+func TestReapPanesRechecksFocusKillsUnfocusedPanesAndReconcilesAggregates(t *testing.T) {
+	originalFocused, originalKill := watchFocused, watchKillPane
 	originalReconcile := watchReconcile
 	t.Cleanup(func() {
-		watchClear, watchKillPane = originalClear, originalKill
+		watchFocused, watchKillPane = originalFocused, originalKill
 		watchReconcile = originalReconcile
 	})
 
-	var cleared, killed []string
+	var killed []string
 	reconciled := 0
-	watchClear = func(target string) error {
-		cleared = append(cleared, target)
-		return nil
-	}
+	watchFocused = func() (map[string]bool, error) { return map[string]bool{"%1": true}, nil }
 	watchKillPane = func(target string) error {
 		killed = append(killed, target)
 		return nil
@@ -228,14 +225,54 @@ func TestReapPanesClearsStateKillsEveryPaneAndReconcilesAggregates(t *testing.T)
 	if err != nil {
 		t.Fatalf("ReapPanes() error = %v", err)
 	}
-	if !slices.Equal(cleared, []string{"%1", "%2"}) {
-		t.Fatalf("cleared = %#v, want both panes", cleared)
+	if !slices.Equal(killed, []string{"%2"}) {
+		t.Fatalf("killed = %#v, want only unfocused pane", killed)
+	}
+	if len(report.Removed) != 1 || report.Removed[0].ID != "%2" ||
+		len(report.Protected) != 1 || report.Protected[0].ID != "%1" ||
+		len(report.Failed) != 0 || reconciled != 1 {
+		t.Fatalf("report = %#v reconciled=%d, want focused protection and one removal", report, reconciled)
+	}
+}
+
+func TestReapPanesKillFailureDoesNotStopRemainingKills(t *testing.T) {
+	originalFocused, originalKill := watchFocused, watchKillPane
+	originalReconcile := watchReconcile
+	t.Cleanup(func() {
+		watchFocused, watchKillPane = originalFocused, originalKill
+		watchReconcile = originalReconcile
+	})
+
+	var killed []string
+	reconciled := 0
+	watchFocused = func() (map[string]bool, error) { return map[string]bool{}, nil }
+	watchKillPane = func(target string) error {
+		killed = append(killed, target)
+		if target == "%1" {
+			return errors.New("pane survived")
+		}
+		return nil
+	}
+	watchReconcile = func() error {
+		reconciled++
+		return nil
+	}
+	candidates := []ReapCandidate{
+		{PaneState: PaneState{PaneInfo: tmux.PaneInfo{ID: "%1"}}},
+		{PaneState: PaneState{PaneInfo: tmux.PaneInfo{ID: "%2"}}},
+	}
+
+	report, err := ReapPanes(candidates)
+	if err == nil || !strings.Contains(err.Error(), "pane survived") {
+		t.Fatalf("ReapPanes() error = %v, want kill failure", err)
 	}
 	if !slices.Equal(killed, []string{"%1", "%2"}) {
-		t.Fatalf("killed = %#v, want both panes", killed)
+		t.Fatalf("kill attempts = %#v, want both confirmed panes", killed)
 	}
-	if len(report.Removed) != 2 || len(report.Failed) != 0 || reconciled != 1 {
-		t.Fatalf("report = %#v reconciled=%d, want 2 removed and one reconcile", report, reconciled)
+	if len(report.Removed) != 1 || report.Removed[0].ID != "%2" ||
+		len(report.Failed) != 1 || report.Failed[0].Candidate.ID != "%1" ||
+		len(report.Protected) != 0 || reconciled != 1 {
+		t.Fatalf("report = %#v reconciled=%d, want one failure and one removal", report, reconciled)
 	}
 }
 
