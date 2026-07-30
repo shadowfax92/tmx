@@ -42,13 +42,14 @@ type ScratchConfig struct {
 }
 
 type WatchConfig struct {
-	Poll         Duration `yaml:"poll"`
-	GracePeriods int      `yaml:"grace_periods"`
-	Period       Duration `yaml:"period"`
-	CaptureLines int      `yaml:"capture_lines"`
-	Agents       []string `yaml:"agents"`
-	ReapTTL      Duration `yaml:"reap_ttl"`
-	FocusCommand string   `yaml:"focus_command,omitempty"`
+	Poll         Duration            `yaml:"poll"`
+	GracePeriods int                 `yaml:"grace_periods"`
+	Period       Duration            `yaml:"period"`
+	CaptureLines int                 `yaml:"capture_lines"`
+	Agents       []string            `yaml:"agents"`
+	ReapTTL      Duration            `yaml:"reap_ttl"`
+	FocusCommand string              `yaml:"focus_command,omitempty"`
+	InboxZero    NotificationBackend `yaml:"inbox_zero,omitempty"`
 }
 
 type JumpAction string
@@ -67,6 +68,24 @@ func (a *JumpAction) UnmarshalYAML(value *yaml.Node) error {
 		return nil
 	default:
 		return fmt.Errorf("invalid jump_action %q (want select, focus, or zoom)", value.Value)
+	}
+}
+
+type NotificationBackend string
+
+const (
+	NotificationTmux      NotificationBackend = "tmux"
+	NotificationMacNotify NotificationBackend = "mac-notify"
+)
+
+func (b *NotificationBackend) UnmarshalYAML(value *yaml.Node) error {
+	backend := NotificationBackend(strings.TrimSpace(value.Value))
+	switch backend {
+	case NotificationTmux, NotificationMacNotify:
+		*b = backend
+		return nil
+	default:
+		return fmt.Errorf("invalid notification backend %q (want tmux or mac-notify)", value.Value)
 	}
 }
 
@@ -198,6 +217,9 @@ func (c *Config) resolve() {
 	if c.Watch.ReapTTL <= 0 {
 		c.Watch.ReapTTL = Duration(DefaultWatchReapTTL)
 	}
+	if c.Watch.InboxZero == "" {
+		c.Watch.InboxZero = NotificationTmux
+	}
 }
 
 const defaultConfigBody = `# tmx configuration
@@ -236,6 +258,8 @@ watch:
   capture_lines: 30
   agents: [claude, codex]
   reap_ttl: 24h
+  # Where an empty 'tmx jump' is shown: tmux (default) or mac-notify.
+  # inbox_zero: mac-notify
   # Used by profiles with jump_action: focus. {pane} becomes the target pane id.
   # focus_command: '~/.tmux/focus-inplace.sh focus "{pane}"'
 `

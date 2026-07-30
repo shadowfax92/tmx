@@ -152,6 +152,8 @@ watch:
   capture_lines: 30
   agents: [claude, codex]
   reap_ttl: 24h
+  # Show an empty `tmx jump` via tmux (default) or mac-notify.
+  inbox_zero: mac-notify
   # Used when the selected profile has jump_action: focus.
   # focus_command: '~/.tmux/focus-inplace.sh focus "{pane}"'
 ```
@@ -173,8 +175,10 @@ Live pane/window state stays in tmux; watcher lifecycle files (`watch.pid`,
 override that location.
 
 Visiting an unread pane clears it within one watcher tick; `tmx jump` clears it
-immediately. For instant focus-driven clearing regardless of the watcher poll
-interval, add this hook to your tmux configuration:
+immediately. Set `watch.inbox_zero: mac-notify` to send an empty-queue result
+through `mac-notify`; if the helper is unavailable, tmx falls back to its tmux
+status message. For instant focus-driven clearing regardless of the watcher
+poll interval, add this hook to your tmux configuration:
 
 ```tmux
 set-hook -g pane-focus-in "run-shell 'tmx mark read --if-unread -t \"#{hook_pane}\"'"

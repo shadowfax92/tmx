@@ -51,9 +51,11 @@ func (tmuxJumpBackend) RunShell(command string) error {
 }
 
 type jumpDeps struct {
-	backend  jumpBackend
-	snapshot func() ([]attn.PaneState, error)
-	markRead func(attn.PaneState) error
+	backend         jumpBackend
+	snapshot        func() ([]attn.PaneState, error)
+	markRead        func(attn.PaneState) error
+	inboxZero       config.NotificationBackend
+	notifyInboxZero func() error
 }
 
 func init() {
@@ -73,9 +75,11 @@ func newJumpCommand() *cobra.Command {
 			}
 			action, _ := cfg.Scratch.ResolveJumpAction()
 			return runJump(action, cfg.Watch.FocusCommand, jumpDeps{
-				backend:  tmuxJumpBackend{},
-				snapshot: attn.Snapshot,
-				markRead: markPaneRead,
+				backend:         tmuxJumpBackend{},
+				snapshot:        attn.Snapshot,
+				markRead:        markPaneRead,
+				inboxZero:       cfg.Watch.InboxZero,
+				notifyInboxZero: sendInboxZeroNotification,
 			})
 		},
 	}
@@ -107,7 +111,33 @@ func runJump(action config.JumpAction, focusCommand string, deps jumpDeps) error
 			return nil
 		}
 	}
+	return reportInboxZero(client, deps)
+}
+
+func reportInboxZero(client string, deps jumpDeps) error {
+	if deps.inboxZero == config.NotificationMacNotify && deps.notifyInboxZero != nil {
+		if err := deps.notifyInboxZero(); err == nil {
+			return nil
+		}
+	}
 	return deps.backend.DisplayMessage(client, "inbox zero")
+}
+
+func sendInboxZeroNotification() error {
+	output, err := exec.Command(
+		"mac-notify",
+		"send",
+		"inbox zero",
+		"--source", "tmx",
+		"--id", "tmx-inbox-zero",
+	).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if detail := strings.TrimSpace(string(output)); detail != "" {
+		return fmt.Errorf("mac-notify: %s (%w)", detail, err)
+	}
+	return fmt.Errorf("mac-notify: %w", err)
 }
 
 // jumpToTarget is the shared selected-pane path for `jump` and `inbox`.
