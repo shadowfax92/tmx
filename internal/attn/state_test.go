@@ -100,29 +100,52 @@ func TestSnapshotReadsAllAttentionOptionsInOnePass(t *testing.T) {
 	}
 }
 
-func TestClearUnreadCountNeverGoesNegative(t *testing.T) {
+func TestConcurrentStateTransitionsAdjustWindowCountOnce(t *testing.T) {
 	fake := newFakeStateBackend()
 	fake.options["%1"] = map[string]string{StateOption: string(StateUnread)}
-	fake.windowCount = 0
+	fake.windowCount = 2
 	stubStateBackend(t, fake)
 
-	if err := Clear("%1"); err != nil {
-		t.Fatalf("Clear() error = %v", err)
-	}
-	if fake.windowCount != 0 {
-		t.Fatalf("window unread count = %d, want clamped zero", fake.windowCount)
+	runConcurrently(t, func() error { return Clear("%1") }, func() error { return Clear("%1") })
+	if fake.windowCount != 1 {
+		t.Fatalf("window unread count after duplicate clears = %d, want 1", fake.windowCount)
 	}
 	if !slices.Equal(fake.adjustments, []int{-1}) {
-		t.Fatalf("window adjustments = %#v, want [-1]", fake.adjustments)
+		t.Fatalf("clear adjustments = %#v, want [-1]", fake.adjustments)
+	}
+
+	fake.options["%2"] = map[string]string{StateOption: string(StateActive)}
+	fake.windowCount = 0
+	fake.adjustments = nil
+	unread := PaneState{Watch: true, State: StateUnread, Since: 42, Hash: "same"}
+	runConcurrently(t, func() error { return Set("%2", unread) }, func() error { return Set("%2", unread) })
+	if fake.windowCount != 1 {
+		t.Fatalf("window unread count after duplicate flags = %d, want 1", fake.windowCount)
+	}
+	if !slices.Equal(fake.adjustments, []int{1}) {
+		t.Fatalf("flag adjustments = %#v, want [1]", fake.adjustments)
+	}
+}
+
+func runConcurrently(t *testing.T, operations ...func() error) {
+	t.Helper()
+	errs := make(chan error, len(operations))
+	for _, operation := range operations {
+		go func() { errs <- operation() }()
+	}
+	for range operations {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent operation error = %v", err)
+		}
 	}
 }
 
 func TestResolveTargetAcceptsPaneWindowAndSession(t *testing.T) {
 	fake := newFakeStateBackend()
 	fake.resolutions = map[string]string{
-		"%7":     "%7",
-		"work:2": "%8",
-		"=tpp/5": "%9",
+		"%7":      "%7",
+		"work:2":  "%8",
+		"=tpp/5:": "%9",
 	}
 	stubStateBackend(t, fake)
 
@@ -134,7 +157,7 @@ func TestResolveTargetAcceptsPaneWindowAndSession(t *testing.T) {
 	}{
 		{name: "pane id", target: "%7", want: "%7", passed: "%7"},
 		{name: "window", target: "work:2", want: "%8", passed: "work:2"},
-		{name: "session", target: "tpp/5", want: "%9", passed: "=tpp/5"},
+		{name: "session", target: "tpp/5", want: "%9", passed: "=tpp/5:"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -154,6 +177,7 @@ func TestResolveTargetAcceptsPaneWindowAndSession(t *testing.T) {
 
 type fakeStateBackend struct {
 	mu                sync.Mutex
+	stateMu           sync.Mutex
 	options           map[string]map[string]string
 	resolutions       map[string]string
 	windowCount       int
@@ -176,6 +200,7 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 	originalList, originalDisplay := listPanesFormat, displayPaneFormat
 	originalShow, originalSet := showPaneVar, setPaneVar
 	originalUnset, originalAdjust := unsetPaneVar, adjustWindowVar
+	originalLock, originalUnlock := lockState, unlockState
 
 	listPanesFormat = func(format string) (string, error) {
 		fake.listCalls++
@@ -183,6 +208,8 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 		return fake.listOutput, nil
 	}
 	displayPaneFormat = func(target, _ string) (string, error) {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
 		fake.lastDisplayTarget = target
 		if resolved, ok := fake.resolutions[target]; ok {
 			return resolved, nil
@@ -219,9 +246,18 @@ func stubStateBackend(t *testing.T, fake *fakeStateBackend) {
 		}
 		return nil
 	}
+	lockState = func(_ string) error {
+		fake.stateMu.Lock()
+		return nil
+	}
+	unlockState = func(_ string) error {
+		fake.stateMu.Unlock()
+		return nil
+	}
 	t.Cleanup(func() {
 		listPanesFormat, displayPaneFormat = originalList, originalDisplay
 		showPaneVar, setPaneVar = originalShow, originalSet
 		unsetPaneVar, adjustWindowVar = originalUnset, originalAdjust
+		lockState, unlockState = originalLock, originalUnlock
 	})
 }

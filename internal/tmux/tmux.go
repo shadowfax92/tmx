@@ -242,6 +242,16 @@ func ShowWindowVar(target, key string) (string, error) {
 	return run("show-options", "-w", "-q", "-v", "-t", target, "@"+key)
 }
 
+func WaitForLock(channel string) error {
+	_, err := run("wait-for", "-L", channel)
+	return err
+}
+
+func WaitForUnlock(channel string) error {
+	_, err := run("wait-for", "-U", channel)
+	return err
+}
+
 // AdjustWindowVar changes an integer window option inside the tmux server.
 // Negative results are clamped at zero. Expanding the old value and setting
 // the new one in one command prevents concurrent clear operations from

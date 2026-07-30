@@ -45,6 +45,8 @@ var (
 	setPaneVar        = tmux.SetPaneVar
 	unsetPaneVar      = tmux.UnsetPaneVar
 	adjustWindowVar   = tmux.AdjustWindowVar
+	lockState         = tmux.WaitForLock
+	unlockState       = tmux.WaitForUnlock
 )
 
 // Snapshot returns attention state alongside the existing pane inventory.
@@ -114,7 +116,7 @@ func normalizeTarget(target string) string {
 	case '%', '@', '$', '=':
 		return target
 	default:
-		return "=" + target
+		return "=" + target + ":"
 	}
 }
 
@@ -159,38 +161,40 @@ func Set(target string, state PaneState) error {
 	if err != nil {
 		return err
 	}
-	previous, err := showPaneVar(paneID, StateOption)
-	if err != nil {
-		return err
-	}
-
-	watch := "0"
-	if state.Watch {
-		watch = "1"
-	}
-	values := []struct {
-		key   string
-		value string
-	}{
-		{WatchOption, watch},
-		{SinceOption, strconv.FormatInt(state.Since, 10)},
-		{HashOption, state.Hash},
-		{StateOption, string(state.State)},
-	}
-	for _, value := range values {
-		if err := setPaneVar(paneID, value.key, value.value); err != nil {
+	return withPaneLock(paneID, func() error {
+		previous, err := showPaneVar(paneID, StateOption)
+		if err != nil {
 			return err
 		}
-	}
 
-	switch {
-	case AttentionState(previous) != StateUnread && state.State == StateUnread:
-		return adjustWindowVar(paneID, WindowUnreadCountOption, 1)
-	case AttentionState(previous) == StateUnread && state.State != StateUnread:
-		return adjustWindowVar(paneID, WindowUnreadCountOption, -1)
-	default:
-		return nil
-	}
+		watch := "0"
+		if state.Watch {
+			watch = "1"
+		}
+		values := []struct {
+			key   string
+			value string
+		}{
+			{WatchOption, watch},
+			{SinceOption, strconv.FormatInt(state.Since, 10)},
+			{HashOption, state.Hash},
+			{StateOption, string(state.State)},
+		}
+		for _, value := range values {
+			if err := setPaneVar(paneID, value.key, value.value); err != nil {
+				return err
+			}
+		}
+
+		switch {
+		case AttentionState(previous) != StateUnread && state.State == StateUnread:
+			return adjustWindowVar(paneID, WindowUnreadCountOption, 1)
+		case AttentionState(previous) == StateUnread && state.State != StateUnread:
+			return adjustWindowVar(paneID, WindowUnreadCountOption, -1)
+		default:
+			return nil
+		}
+	})
 }
 
 // Clear unsets the complete pane contract. Clearing an unread pane also
@@ -200,21 +204,33 @@ func Clear(target string) error {
 	if err != nil {
 		return err
 	}
-	previous, err := showPaneVar(paneID, StateOption)
-	if err != nil {
+	return withPaneLock(paneID, func() error {
+		previous, err := showPaneVar(paneID, StateOption)
+		if err != nil {
+			return err
+		}
+
+		var errs []error
+		for _, key := range []string{WatchOption, StateOption, SinceOption, HashOption} {
+			if err := unsetPaneVar(paneID, key); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if AttentionState(previous) == StateUnread {
+			if err := adjustWindowVar(paneID, WindowUnreadCountOption, -1); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	})
+}
+
+func withPaneLock(paneID string, operation func() error) error {
+	channel := "tmx-attn-state-" + paneID
+	if err := lockState(channel); err != nil {
 		return err
 	}
-
-	var errs []error
-	for _, key := range []string{WatchOption, StateOption, SinceOption, HashOption} {
-		if err := unsetPaneVar(paneID, key); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if AttentionState(previous) == StateUnread {
-		if err := adjustWindowVar(paneID, WindowUnreadCountOption, -1); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
+	operationErr := operation()
+	unlockErr := unlockState(channel)
+	return errors.Join(operationErr, unlockErr)
 }
